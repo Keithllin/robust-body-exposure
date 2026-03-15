@@ -112,21 +112,28 @@ def compute_field_guided_action(
             
         try:
             # Draw Red Sphere at pick_pos
-            p.addUserDebugText("Pick", pick_pos, textColorRGB=[1, 0, 0], **client_args)
+            p.addUserDebugText("Pick", pick_pos, textColorRGB=[1, 0, 0], textSize=1.2, **client_args)
             # Draw a small sphere marker (using a short line as a point or actual visual shape if complex, 
             # but text + line is usually sufficient for debug. Let's add a small cross)
-            d = 0.02
-            p.addUserDebugLine(pick_pos - [d,0,0], pick_pos + [d,0,0], [1, 0, 0], lineWidth=2, **client_args)
-            p.addUserDebugLine(pick_pos - [0,d,0], pick_pos + [0,d,0], [1, 0, 0], lineWidth=2, **client_args)
-            p.addUserDebugLine(pick_pos - [0,0,d], pick_pos + [0,0,d], [1, 0, 0], lineWidth=2, **client_args)
+            d = 0.03
+            p.addUserDebugLine(pick_pos - [d,0,0], pick_pos + [d,0,0], [1, 0, 0], lineWidth=3, **client_args)
+            p.addUserDebugLine(pick_pos - [0,d,0], pick_pos + [0,d,0], [1, 0, 0], lineWidth=3, **client_args)
+            p.addUserDebugLine(pick_pos - [0,0,d], pick_pos + [0,0,d], [1, 0, 0], lineWidth=3, **client_args)
 
             # Draw Green Line/Arrow from pick_pos to place_pos
-            p.addUserDebugLine(pick_pos, place_pos, lineColorRGB=[0, 1, 0], lineWidth=3, **client_args)
+            debug_len = max(step_size * 2.5, 0.35)
+            debug_end = pick_pos + debug_len * force_direction
+            p.addUserDebugLine(pick_pos, debug_end, lineColorRGB=[0, 1, 0], lineWidth=6, **client_args)
+            # arrow head
+            head_back = debug_end - 0.06 * force_direction
+            perp = np.array([-force_direction[1], force_direction[0], 0.0])
+            p.addUserDebugLine(debug_end, head_back + 0.03 * perp, lineColorRGB=[0, 1, 0], lineWidth=5, **client_args)
+            p.addUserDebugLine(debug_end, head_back - 0.03 * perp, lineColorRGB=[0, 1, 0], lineWidth=5, **client_args)
             
             # Draw text label "Field Force" above the arrow midpoint
-            midpoint = (pick_pos + place_pos) / 2
+            midpoint = (pick_pos + debug_end) / 2
             midpoint[2] += 0.05 # Offset Z slightly
-            p.addUserDebugText("Field Force", midpoint, textColorRGB=[0, 1, 0], **client_args)
+            p.addUserDebugText("Field Force", midpoint, textColorRGB=[0, 1, 0], textSize=1.2, **client_args)
             
         except Exception as e:
             print(f"Warning: PyBullet debug visualization failed: {e}")

@@ -134,7 +134,7 @@ class RobeReversibleEnv(AssistiveEnv):
                 color = [1, 0, 0]
             p.addUserDebugText(text=str(i), textPosition=v, textColorRGB=color, textSize=1, lifeTime=0, physicsClientId=self.id)
 
-        p.setGravity(0, 0, 0, physicsClientId=self.id)
+        # p.setGravity(0, 0, 0, physicsClientId=self.id)
 
         # * calculate distance between the 2D grasp location and every point on the blanket, anchor points are the 4 points on the blanket closest to the 2D grasp location
         dist, is_on_cloth = check_grasp_on_cloth(uncover_action, np.array(self.cloth_initial[1]), clipping_thres=.028)

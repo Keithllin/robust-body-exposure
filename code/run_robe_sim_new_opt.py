@@ -6,12 +6,11 @@ import argparse
 
 from torch import multiprocessing
 
-sys.path.insert(0, './assistive-gym-fem')
+sys.path.insert(0, '../assistive-gym-fem')
 import os.path as osp
 from pathlib import Path
 
 import random
-import pickle
 import cma
 import numpy as np
 import torch
@@ -31,8 +30,15 @@ import gradient_free_optimizers as gfo
 #%%
 recover = True
 test = False
+model_path_uncover = '/mnt/data/MudkipUsersSu2025/kpputhuveetil/git/robe/robust-body-exposure_unstable/trained_models/FINAL_MODELS/Recover/TL_2, 4, 5, 8, 10, 11, 12, 13, 14, 15_Uncover_10000_states_New_Grasp_16000_epochs=250_batch=50_workers=4_1705905825'
 
 eval_dir_name = 'cma_evaluations'
+search_dir = osp.join(model_path_uncover, eval_dir_name)
+
+eval_conditions = ['TL_[2, 4, 5, 8, 10, 11, 12, 13, 14, 15]_Uncover_Evals_Train_500_states']
+data_path = osp.join(model_path_uncover, eval_dir_name, eval_conditions[0], 'raw/')
+
+filenames = list(Path(data_path).glob('*.pkl'))
 
 x0 = []
 target_limb_list = [2, 4, 5, 8, 10, 11, 12, 13, 14, 15]
@@ -103,9 +109,17 @@ def get_cost(action, all_body_points, first_cloth, cloth_initial_2D, cloth_final
 def counter_callback(output):
     global counter
     counter += 1
-    print(f"{counter} - Trial Completed: CMA-ES Best Reward:{output[1]:.2f}, Sim Reward: {output[3]:.2f}, CMA Time: {output[4]/60:.2f}, TL: {output[5]}, GoC: {output[6]}")
+    print(f"{counter} - Trial Completed: CMA-ES Best Reward:{output[1]:.2f}, Sim Reward: {output[3]:.2f}, Opt Time: {output[4]/60:.2f}min, Sim Time: {output[7]/60:.2f}min, TL: {output[5]}, GoC: {output[6]}")
 
-def optimizer(env_name, idx, model, device, target_limb_code, iter_data_dir, graph_config, env_var, max_fevals, recover_samples=None):
+def find(seed):
+    for eval_condition in eval_conditions:
+        path = Path(model_path_uncover +'/' + eval_dir_name + '/' + eval_condition + '/raw/')
+        filenames = path.glob('*.pkl')
+        for f in filenames:
+            if str(seed) in f.name:
+                return f
+    #%%
+def optimizer(env_name, idx, model, device, target_limb_code, iter_data_dir, graph_config, env_var, max_fevals):
     use_disp = graph_config['use_disp']
     filter_draping = graph_config['filt_drape']
     rot_draping = graph_config['rot_drape']
@@ -120,18 +134,11 @@ def optimizer(env_name, idx, model, device, target_limb_code, iter_data_dir, gra
 
     # choose uncovered state from test set to recover from
     if recover:
-        if not recover_samples:
-            raise FileNotFoundError('No recover dataset pickle files were provided. Pass --recover-dataset/--recover-eval-condition to point to your raw pickles.')
-        random_file = Path(np.random.choice(recover_samples))
+        random_file = np.random.choice(list((Path(model_path_uncover)/eval_dir_name/eval_conditions[0]/'raw').iterdir()))
         seed = int(random_file.name.split('_')[2])
         target_limb_code = int(random_file.name.split('_')[0].replace('tl', ''))
         seed_path = open(random_file, 'rb')
         raw_data = pickle.load(seed_path)
-        uncover_action = raw_data.get('uncover_action')
-        if uncover_action is None and 'action' in raw_data:
-            uncover_action = raw_data['action']
-        if uncover_action is None:
-            raise KeyError('Recover dataset entry missing uncover_action/action; cannot seed optimization. Consider regenerating raw pickles with uncover_action saved.')
 
     env = make_env(env_name, coop=coop, seed=seed)
 
@@ -154,7 +161,7 @@ def optimizer(env_name, idx, model, device, target_limb_code, iter_data_dir, gra
         cloth_initial_dc = np.delete(np.array(raw_data['info']['cloth_initial'][1]), 2, axis=1)
         cloth_intermediate_dc = raw_data['info']['cloth_final'][1]
         input_cloth = cloth_intermediate_dc
-        uncover_action = np.asarray(uncover_action)
+        uncover_action = raw_data['uncover_action']
     else:
         cloth_initial_dc = []
         input_cloth = env.get_cloth_state()
@@ -220,13 +227,15 @@ def optimizer(env_name, idx, model, device, target_limb_code, iter_data_dir, gra
 
     best_action = para_to_action(best_para)
 
-    best_time = t1-t0
+    optimizer_time = t1-t0  # Time for optimization only
     best_fevals = None
     best_iterations = None
 
     best_cost, best_pred, best_covered_status, best_is_on_cloth = cost_function(best_action, all_body_points, cloth_initial_dc, input_cloth, graph, model, device, use_disp, use_3D)
     best_reward = -best_cost
 
+    # Start timing simulation execution
+    t_sim_start = time.time()
     if recover:
         cloth_initial_sim, cloth_intermediate_sim, execute_recover_action = env.uncover_step(uncover_action)
         cloth_final_sim, execute_recover_action = env.recover_step(best_action) # if recovering recover action is predicted by the model
@@ -235,9 +244,11 @@ def optimizer(env_name, idx, model, device, target_limb_code, iter_data_dir, gra
         cloth_final_sim, execute_recover_action = env.recover_step([]) # if not recovering, don't need to provide an action
 
     observation, uncover_reward, recover_reward, done, info = env.get_info()
+    t_sim_end = time.time()
+    sim_time = t_sim_end - t_sim_start  # Time for simulation only
 
     sim_info = {'observation':observation, 'uncover reward':uncover_reward, 'recover_reward':recover_reward, 'done':done, 'info':info}
-    cma_info = {'best_cost':best_cost, 'best_reward':best_reward, 'best_pred':best_pred, 'best_time':best_time,
+    cma_info = {'best_cost':best_cost, 'best_reward':best_reward, 'best_pred':best_pred, 'optimizer_time':optimizer_time, 'sim_time':sim_time,
                 'best_covered_status':best_covered_status, 'best_fevals':best_fevals, 'best_iterations':best_iterations}
 
     if recover:
@@ -265,10 +276,10 @@ def optimizer(env_name, idx, model, device, target_limb_code, iter_data_dir, gra
             cma_info,
             iter_data_dir)
 
-    return seed, best_reward, uncover_reward, recover_reward, best_time, target_limb_code, best_is_on_cloth
+    return seed, best_reward, uncover_reward, recover_reward, optimizer_time, target_limb_code, best_is_on_cloth, sim_time
 
 
-def evaluate_dyn_model(env_name, target_limb_code, trials, model, iter_data_dir, device, num_processes, graph_config, env_variations, max_fevals, recover_samples=None):
+def evaluate_dyn_model(env_name, target_limb_code, trials, model, iter_data_dir, device, num_processes, graph_config, env_variations, max_fevals):
 
     result_objs = []
     # ! Why doing trials/num_processes? equals 1
@@ -276,16 +287,19 @@ def evaluate_dyn_model(env_name, target_limb_code, trials, model, iter_data_dir,
         with multiprocessing.Pool(processes=num_processes) as pool:
             for i in range(num_processes):
                 idx = i+(j*num_processes)
-                result = pool.apply_async(optimizer, args = (env_name, idx, model, device, target_limb_code, iter_data_dir, graph_config, env_variations, max_fevals, recover_samples), callback=counter_callback)
-                result_objs.append(result)
+                if idx < trials:
+                    result = pool.apply_async(optimizer, args = (env_name, idx, model, device, target_limb_code, iter_data_dir, graph_config, env_variations, max_fevals), callback=counter_callback)
+                    result_objs.append(result)
 
+            # Important: results should be collected from all objects
             results = [result.get() for result in result_objs]
-            all_results.append(results)
 
     results_array = np.array(results)
-    pred_sim_reward_error = abs(results_array[:,2] - results_array[:,1])
+    # Compare predicted reward (1) with ACTUAL recover reward (3)
+    pred_sim_reward_error = abs(results_array[:, 3] - results_array[:, 1])
 
-    return list(results_array[:,1]), list(results_array[:,2]), list(pred_sim_reward_error)
+    # Return: best_pred (1), actual_recover (3), error, opt_times (4), sim_times (7)
+    return list(results_array[:, 1]), list(results_array[:, 3]), list(pred_sim_reward_error), list(results_array[:, 4]), list(results_array[:, 7])
 
 
 #%%
@@ -293,7 +307,8 @@ def evaluate_dyn_model(env_name, target_limb_code, trials, model, iter_data_dir,
 if __name__ == '__main__':
     multiprocessing.set_start_method('spawn')
 
-    trained_models_dir = './trained_models/FINAL_MODELS'
+    # trained_models_dir = '../trained_models/FINAL_MODELS'
+    trained_models_dir = '/mnt/data/MudkipUsersSu2025/kpputhuveetil/git/robe/robust-body-exposure_unstable/trained_models/FINAL_MODELS'
 
     parser = argparse.ArgumentParser(description='')
     parser.add_argument('--eval-multiple-models', type=bool, default=False)
@@ -303,17 +318,7 @@ if __name__ == '__main__':
     parser.add_argument('--max-fevals', type=int, default=300)
     parser.add_argument('--num-rollouts', type=int, default=500)
     parser.add_argument('--arg_seed', type=int, default=0)
-    parser.add_argument('--recover-dataset', type=str, help='Path containing cma_evaluations/<condition>/raw pickles to sample recover states from (defaults to checkpoint folder)')
-    parser.add_argument('--recover-eval-condition', type=str, help='Name of the recover evaluation condition folder to read (defaults to TL_[...]_Recover_Evals_Train_500_states)')
-    parser.add_argument('--uncover-eval-condition', type=str, help='Name of the uncover evaluation condition folder to read (defaults to TL_[...]_Uncover_Evals_Train_500_states)')
-    parser.add_argument('--mode', choices=['recover', 'uncover'], default='recover', help='Whether to run recover (default) or uncover evaluations')
     args = parser.parse_args()
-
-    recover = args.mode == 'recover'
-
-    target_limb_tag = f"[{', '.join(str(tl) for tl in target_limb_list)}]"
-    recover_condition_name = args.recover_eval_condition or f'TL_{target_limb_tag}_Recover_Evals_Train_500_states'
-    uncover_condition_name = args.uncover_eval_condition or f'TL_{target_limb_tag}_Uncover_Evals_Train_500_states'
 
     if not args.eval_multiple_models:
         loop_data = [{
@@ -338,24 +343,11 @@ if __name__ == '__main__':
 
     for i in range(len(loop_data)):
         data = loop_data[i]
-        checkpoint_path = Path(trained_models_dir, data['model']).expanduser().resolve()
-        checkpoint = str(checkpoint_path)
+        checkpoint= osp.join(trained_models_dir, data['model'])
         env_var = data['env_var']
         env_variations = all_env_vars[env_var]
         graph_config = all_graph_configs[data['graph_config']]
         max_fevals = data['max_fevals']
-
-        condition_name = recover_condition_name if recover else uncover_condition_name
-        recover_sample_paths = None
-        if recover:
-            dataset_root = Path(args.recover_dataset).expanduser().resolve() if args.recover_dataset else checkpoint_path
-            recover_dataset_raw_dir = dataset_root / eval_dir_name / condition_name / 'raw'
-            if not recover_dataset_raw_dir.exists():
-                raise FileNotFoundError(f'Recover dataset not found at {recover_dataset_raw_dir}. Use --recover-dataset/--recover-eval-condition to point to the pickles you copied from the source repo.')
-            recover_dataset_files = sorted(recover_dataset_raw_dir.glob('*.pkl'))
-            if not recover_dataset_files:
-                raise FileNotFoundError(f'No *.pkl files found under {recover_dataset_raw_dir}')
-            recover_sample_paths = [str(p) for p in recover_dataset_files]
 
         data_dir = osp.join(checkpoint, f'cma_evaluations/TL_{target_limb_list}_{recover_string}_{test_string}_{args.num_rollouts}_states_RandomSearch_Opt')
         Path(data_dir).mkdir(parents=True, exist_ok=True)
@@ -369,6 +361,9 @@ if __name__ == '__main__':
 
         counter = 0
         all_results = []
+        all_opt_times = []
+        all_sim_times = []
+        start_wall_clock = time.time()
 
         num_processes = multiprocessing.cpu_count() - 1
 
@@ -376,7 +371,7 @@ if __name__ == '__main__':
         iterations = round(args.num_rollouts/num_processes)
 
         for iter in tqdm(range(iterations)):
-            cma_reward, sim_reward, pred_sim_reward_error = evaluate_dyn_model(
+            cma_reward, sim_reward, pred_sim_reward_error, opt_times, sim_times = evaluate_dyn_model(
                 env_name=env_name,
                 target_limb_code = target_limb_code,
                 trials = trials,
@@ -386,7 +381,32 @@ if __name__ == '__main__':
                 num_processes = num_processes,
                 graph_config = graph_config,
                 env_variations = env_variations,
-                max_fevals=max_fevals,
-                recover_samples=recover_sample_paths)
+                max_fevals=max_fevals)
+            
+            all_opt_times.extend(opt_times)
+            all_sim_times.extend(sim_times)
+            
+        end_wall_clock = time.time()
+        wall_clock_duration = end_wall_clock - start_wall_clock
 
-    print("ALL EVALS COMPLETE")
+        # Print summary statistics
+        print("\n" + "="*80)
+        print("ALL EVALS COMPLETE - TIME SUMMARY")
+        print("="*80)
+        print(f"Total Rollouts: {len(all_opt_times)}")
+        print(f"Actual Wall-Clock Time: {wall_clock_duration/60:.2f} min ({wall_clock_duration/3600:.2f} hrs)")
+        
+        print(f"\nOptimizer Time (Cumulative):")
+        print(f"  Total Task: {sum(all_opt_times)/60:.2f} min ({sum(all_opt_times)/3600:.2f} hrs)")
+        print(f"  Average:    {np.mean(all_opt_times):.2f} sec")
+        print(f"  Min/Max:    {np.min(all_opt_times):.2f}s / {np.max(all_opt_times):.2f}s")
+        
+        print(f"\nSimulation Time (Cumulative):")
+        print(f"  Total Task: {sum(all_sim_times)/60:.2f} min ({sum(all_sim_times)/3600:.2f} hrs)")
+        print(f"  Average:    {np.mean(all_sim_times):.2f} sec")
+        print(f"  Min/Max:    {np.min(all_sim_times):.2f}s / {np.max(all_sim_times):.2f}s")
+        
+        print(f"\nExecution Efficiency:")
+        print(f"  Parallel Speedup: {(sum(all_opt_times) + sum(all_sim_times)) / wall_clock_duration:.1f}x")
+        print(f"  Optimizer vs Sim: {sum(all_opt_times)/sum(all_sim_times):.2f} ratio")
+        print("="*80)
