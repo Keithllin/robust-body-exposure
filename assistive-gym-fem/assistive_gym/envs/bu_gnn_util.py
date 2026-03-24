@@ -513,10 +513,10 @@ def get_body_points_recovering_reward(all_body_points, cloth_initial_2D, cloth_i
     head_covered_penalty = -100 * (head_covered_penalty / num_head)
 
     reward = covered_reward + uncovered_penalty + head_covered_penalty
-    info = (covered_reward, uncovered_penalty, head_covered_penalty)
+    reward_info = (covered_reward, uncovered_penalty, head_covered_penalty)
 
     if info:
-        return reward, info
+        return reward, reward_info
 
     return (reward, covered_status)
 

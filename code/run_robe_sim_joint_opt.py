@@ -1,6 +1,8 @@
 import argparse
 import json
 import os.path as osp
+import pickle
+import re
 import sys
 import time
 from pathlib import Path
@@ -45,6 +47,8 @@ all_env_vars = {
 INVALID_REWARD = -1e9
 SCREENED_REWARD_BASE = -1e8
 REWARD_EPS = 1e-6
+ACTION_DEDUP_EPS = 0.05
+BASELINE_FILENAME_RE = re.compile(r'^tl(?P<tl>\d+)_c(?P<idx>\d+)_(?P<seed>\d+)_pid(?P<pid>\d+)\.pkl$')
 
 
 def load_runtime_dependencies():
@@ -161,6 +165,177 @@ def safe_mean(values, default=np.nan):
     if len(values) == 0:
         return float(default)
     return float(np.mean(np.asarray(values, dtype=np.float32)))
+
+
+def has_finite_reward(value):
+    try:
+        return np.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def action_distance_inf(action_a, action_b):
+    action_a = np.asarray(action_a, dtype=np.float32)
+    action_b = np.asarray(action_b, dtype=np.float32)
+    return float(np.max(np.abs(action_a - action_b)))
+
+
+def dedupe_action_samples(samples, action_key, eps=ACTION_DEDUP_EPS):
+    deduped = []
+    for sample in samples:
+        action = np.asarray(sample[action_key], dtype=np.float32)
+        if any(action_distance_inf(action, existing[action_key]) < eps for existing in deduped):
+            continue
+        deduped.append(sample)
+    return deduped
+
+
+def parse_baseline_filename(path_obj):
+    match = BASELINE_FILENAME_RE.match(path_obj.name)
+    if match is None:
+        return None
+    return {
+        'target_limb_code': int(match.group('tl')),
+        'eval_idx': int(match.group('idx')),
+        'seed': int(match.group('seed')),
+        'pid': int(match.group('pid')),
+    }
+
+
+def load_baseline_action_pool(raw_dir):
+    raw_path = Path(raw_dir)
+    pool = {
+        'raw_dir': str(raw_path),
+        'available': False,
+        'by_limb': {},
+        'stats': {
+            'num_files': 0,
+            'num_loaded': 0,
+            'num_skipped_bad_name': 0,
+            'num_skipped_read_error': 0,
+            'num_skipped_invalid_fields': 0,
+        },
+    }
+    if not raw_path.exists() or not raw_path.is_dir():
+        pool['stats']['missing_dir'] = True
+        return pool
+
+    samples_by_limb = {tl: [] for tl in target_limb_list}
+    files = sorted(raw_path.glob('*.pkl'))
+    pool['stats']['num_files'] = len(files)
+
+    for path_obj in files:
+        meta = parse_baseline_filename(path_obj)
+        if meta is None:
+            pool['stats']['num_skipped_bad_name'] += 1
+            continue
+        try:
+            with open(path_obj, 'rb') as handle:
+                raw_data = pickle.load(handle)
+        except Exception:
+            pool['stats']['num_skipped_read_error'] += 1
+            continue
+
+        tl = int(raw_data.get('target_limb_code', meta['target_limb_code']))
+        uncover_action = np.asarray(raw_data.get('uncover_action', []), dtype=np.float32)
+        recover_action = np.asarray(raw_data.get('recover_action', []), dtype=np.float32)
+        cma_info = raw_data.get('cma_info', {})
+        best_reward = cma_info.get('best_reward', cma_info.get('pred_recover_reward', np.nan))
+
+        if (
+            tl not in target_limb_list or
+            uncover_action.shape != (4,) or
+            recover_action.shape != (4,) or
+            not has_finite_reward(best_reward)
+        ):
+            pool['stats']['num_skipped_invalid_fields'] += 1
+            continue
+
+        sample = {
+            'path': str(path_obj),
+            'filename': path_obj.name,
+            'seed': int(meta['seed']),
+            'eval_idx': int(meta['eval_idx']),
+            'target_limb_code': tl,
+            'uncover_action': np.clip(uncover_action.astype(np.float32), -1.0, 1.0),
+            'recover_action': np.clip(recover_action.astype(np.float32), -1.0, 1.0),
+            'best_reward': float(best_reward),
+        }
+        samples_by_limb[tl].append(sample)
+        pool['stats']['num_loaded'] += 1
+
+    for tl, samples in samples_by_limb.items():
+        samples.sort(key=lambda sample: sample['best_reward'], reverse=True)
+    pool['available'] = pool['stats']['num_loaded'] > 0
+    pool['by_limb'] = samples_by_limb
+    return pool
+
+
+def summarize_baseline_limb_pool(pool, target_limb_code):
+    if not pool or not pool.get('available', False):
+        return {
+            'available': False,
+            'num_samples': 0,
+            'num_unique_uncover': 0,
+            'num_recover_candidates': 0,
+        }
+    limb_samples = list(pool['by_limb'].get(int(target_limb_code), []))
+    unique_uncover = dedupe_action_samples(limb_samples, 'uncover_action')
+    return {
+        'available': len(limb_samples) > 0,
+        'num_samples': int(len(limb_samples)),
+        'num_unique_uncover': int(len(unique_uncover)),
+        'num_recover_candidates': int(len(limb_samples)),
+    }
+
+
+def select_outer_baseline_seed_samples(pool, target_limb_code, num_seeds, selection_mode, rng):
+    if pool is None or not pool.get('available', False) or num_seeds <= 0:
+        return []
+    limb_samples = list(pool['by_limb'].get(int(target_limb_code), []))
+    if len(limb_samples) == 0:
+        return []
+    unique_samples = dedupe_action_samples(limb_samples, 'uncover_action')
+    if selection_mode == 'random':
+        order = rng.permutation(len(unique_samples))
+        unique_samples = [unique_samples[idx] for idx in order]
+    elif selection_mode == 'best_reward':
+        unique_samples.sort(key=lambda sample: sample['best_reward'], reverse=True)
+    else:
+        raise ValueError(f'Unsupported baseline seed selection mode: {selection_mode}')
+    return unique_samples[:max(0, int(num_seeds))]
+
+
+def collect_baseline_recover_candidates(
+    pool,
+    target_limb_code,
+    topk,
+    paired_sample=None,
+    include_pool=True,
+):
+    candidates = []
+
+    def append_unique(action_policy, source, sample):
+        action_policy = np.clip(np.asarray(action_policy, dtype=np.float32), -1.0, 1.0)
+        if action_policy.shape != (4,):
+            return
+        if any(action_distance_inf(action_policy, existing['action_policy']) < ACTION_DEDUP_EPS for existing in candidates):
+            return
+        candidates.append({
+            'action_policy': action_policy,
+            'source': source,
+            'sample': sample,
+        })
+
+    if paired_sample is not None:
+        append_unique(paired_sample['recover_action'], 'paired_baseline', paired_sample)
+
+    if include_pool and pool is not None and pool.get('available', False) and topk > 0:
+        limb_samples = list(pool['by_limb'].get(int(target_limb_code), []))
+        for sample in limb_samples[:max(0, int(topk))]:
+            append_unique(sample['recover_action'], 'limb_baseline_pool', sample)
+
+    return candidates
 
 
 def is_valid_cloth(cloth, expected_cols=None):
@@ -329,7 +504,7 @@ def build_warm_start_candidates(reference_action_policy, input_cloth, all_body_p
 
     warm_starts = []
     if strategy in ('reverse', 'hybrid'):
-        warm_starts.append(reverse_dict)
+        warm_starts.append({'para': reverse_dict, 'source': 'reverse'})
 
     if strategy in ('field', 'hybrid'):
         try:
@@ -350,12 +525,12 @@ def build_warm_start_candidates(reference_action_policy, input_cloth, all_body_p
             if field_result is not None:
                 pick_pos, place_pos, _ = field_result
                 action_world = np.array([pick_pos[0], pick_pos[1], place_pos[0], place_pos[1]], dtype=np.float32)
-                warm_starts.append(action_to_para(world_to_policy_action(action_world)))
+                warm_starts.append({'para': action_to_para(world_to_policy_action(action_world)), 'source': 'field'})
         except Exception as exc:
             print(f"[WarmStart] Field-guided warm start failed, using fallback: {exc}")
 
     if len(warm_starts) == 0:
-        warm_starts.append(reverse_dict)
+        warm_starts.append({'para': reverse_dict, 'source': 'reverse'})
     return warm_starts
 
 
@@ -502,6 +677,7 @@ def evaluate_recover_candidate(
         recover_f1 = compute_fscore_recover(initial_covered_status, intermediate_status, recover_status, False)
     except Exception as exc:
         detail['status'] = f'recover_reward_exception:{type(exc).__name__}'
+        detail['exception_message'] = str(exc)
         return detail
 
     if not is_valid_reward(reward) or not np.isfinite(recover_f1):
@@ -547,23 +723,57 @@ def optimize_recover_given_uncover(
     feasible_only_best,
     popsize,
     sigma,
+    baseline_recover_candidates=None,
 ):
     import cma
     import gradient_free_optimizers as gfo
 
-    warm_starts = build_warm_start_candidates(
+    warm_start_entries = []
+    if baseline_recover_candidates is None:
+        baseline_recover_candidates = []
+    for candidate in baseline_recover_candidates:
+        if isinstance(candidate, dict):
+            action_policy = candidate['action_policy']
+            source = candidate.get('source', 'baseline')
+            sample = candidate.get('sample')
+        else:
+            action_policy = candidate
+            source = 'baseline'
+            sample = None
+        warm_start_entries.append({
+            'para': action_to_para(action_policy),
+            'source': source,
+            'sample': sample,
+        })
+
+    warm_start_entries.extend(build_warm_start_candidates(
         reference_action_policy=uncover_action_policy,
         input_cloth=intermediate_cloth_3d,
         all_body_points=all_body_points,
         strategy=warm_start_strategy,
         task_type='cover',
-    )
+    ))
+    deduped_warm_start_entries = []
+    for entry in warm_start_entries:
+        action_policy = para_to_action(entry['para'])
+        if any(action_distance_inf(action_policy, para_to_action(existing['para'])) < ACTION_DEDUP_EPS for existing in deduped_warm_start_entries):
+            continue
+        deduped_warm_start_entries.append(entry)
+    warm_start_entries = deduped_warm_start_entries
+    warm_starts = [entry['para'] for entry in warm_start_entries]
     search_space = build_search_space(step_size=0.01)
     trace = []
     best_reward_history = []
     feasible_tracker = {'found': False, 'best_reward': -np.inf, 'best_para': None}
     best_detail = None
     eval_counter = 0
+
+    def identify_action_source(action_policy):
+        action_policy = np.asarray(action_policy, dtype=np.float32)
+        for entry in warm_start_entries:
+            if action_distance_inf(action_policy, para_to_action(entry['para'])) < ACTION_DEDUP_EPS:
+                return entry['source']
+        return 'search'
 
     def record_summary(detail):
         trace.append({
@@ -573,6 +783,9 @@ def optimize_recover_given_uncover(
             'status': detail['status'],
             'is_on_cloth': bool(detail['is_on_cloth']),
             'action_policy': detail['action_policy'].copy(),
+            'source': detail.get('source', 'search'),
+            'baseline_filename': detail.get('baseline_filename'),
+            'exception_message': detail.get('exception_message'),
         })
 
     def evaluate_action(action_policy, eval_idx, description_suffix='recover'):
@@ -591,6 +804,14 @@ def optimize_recover_given_uncover(
             graph_root=graph_root,
             description_suffix=description_suffix,
         )
+        detail['source'] = identify_action_source(detail['action_policy'])
+        detail['baseline_filename'] = None
+        for entry in warm_start_entries:
+            if action_distance_inf(detail['action_policy'], para_to_action(entry['para'])) < ACTION_DEDUP_EPS:
+                sample = entry.get('sample')
+                if sample is not None:
+                    detail['baseline_filename'] = sample.get('filename')
+                break
         record_summary(detail)
         if best_detail is None or detail['reward'] > best_detail['reward'] + REWARD_EPS:
             best_detail = detail
@@ -699,6 +920,9 @@ def optimize_recover_given_uncover(
         'mean_f1_on_cloth': safe_mean([record['f1'] for record in trace if record['is_on_cloth'] and np.isfinite(record['f1'])]),
         'feasible_found': bool(feasible_tracker['found']),
         'selected_from_feasible_tracker': bool(feasible_only_best and feasible_tracker['found']),
+        'num_warm_starts': int(len(warm_starts)),
+        'num_baseline_recover_candidates': int(len(baseline_recover_candidates)),
+        'warm_start_sources': [entry['source'] for entry in warm_start_entries],
         'best_reward_history': best_reward_history,
         'trace': trace,
     }
@@ -926,9 +1150,11 @@ def optimize_joint_actions_coupled(
         'joint_feasible_ratio': float(sum(1 for record in trace if record['status'] == 'feasible') / max(1, len(trace))),
         'uncover_on_cloth_ratio': float(sum(1 for record in trace if record['uncover_is_on_cloth']) / max(1, len(trace))),
         'recover_on_cloth_ratio': float(sum(1 for record in trace if record['recover_is_on_cloth']) / max(1, len(trace))),
-        'best_eval_idx': int(best_detail['eval_idx']),
-        'trace': trace,
-        'generation_summaries': generation_summaries,
+            'best_eval_idx': int(best_detail['eval_idx']),
+            'trace': trace,
+            'generation_summaries': generation_summaries,
+            'stop_reason': es.stop(),
+            'final_countevals': int(es.countevals),
     }
     return best_detail, diagnostics
 
@@ -953,6 +1179,14 @@ def optimize_uncover_sequential_joint(
     recover_warm_start_strategy,
     recover_feasible_only_best,
     screen_uncover_f1_threshold,
+    outer_init_source,
+    baseline_action_pool,
+    baseline_seed_selection,
+    outer_baseline_seeds,
+    outer_random_seeds,
+    inner_include_baseline_recover,
+    inner_baseline_recover_topk,
+    rng,
 ):
     import cma
 
@@ -971,8 +1205,20 @@ def optimize_uncover_sequential_joint(
     eval_counter = 0
     outer_trace = []
     generation_summaries = []
+    if rng is None:
+        rng = np.random.RandomState(0)
+    baseline_pool_summary = summarize_baseline_limb_pool(baseline_action_pool, target_limb_code)
+    init_metadata = {
+        'outer_init_source': str(outer_init_source),
+        'baseline_limb_summary': baseline_pool_summary,
+        'baseline_outer_seed_count': 0,
+        'random_outer_seed_count': 0,
+        'baseline_recover_candidate_count': 0,
+        'generation0_seed_details': [],
+        'fallback_to_heuristic': False,
+    }
 
-    def objective(action_policy):
+    def objective(action_policy, seed_metadata=None):
         nonlocal best_detail, eval_counter
         eval_counter += 1
         uncover_detail = evaluate_uncover_candidate(
@@ -998,6 +1244,12 @@ def optimize_uncover_sequential_joint(
             'recover_f1': float('nan'),
             'is_on_cloth': bool(uncover_detail['is_on_cloth']),
             'recover_success': False,
+            'init_source': None if seed_metadata is None else seed_metadata.get('source'),
+            'uncover_status': uncover_detail['status'],
+            'recover_status': None,
+            'baseline_filename': None if seed_metadata is None or seed_metadata.get('baseline_sample') is None else seed_metadata['baseline_sample']['filename'],
+            'baseline_reward': None if seed_metadata is None or seed_metadata.get('baseline_sample') is None else float(seed_metadata['baseline_sample']['best_reward']),
+            'exception_message': None,
         }
         candidate_detail = {
             'best_outer_eval_idx': int(eval_counter),
@@ -1010,6 +1262,8 @@ def optimize_uncover_sequential_joint(
             'recover_detail': None,
             'joint_reward': float(INVALID_REWARD),
             'status': uncover_detail['status'],
+            'init_source': None if seed_metadata is None else seed_metadata.get('source'),
+            'baseline_sample': None if seed_metadata is None else seed_metadata.get('baseline_sample'),
         }
 
         if uncover_detail['status'] != 'valid_uncover':
@@ -1049,6 +1303,17 @@ def optimize_uncover_sequential_joint(
             feasible_only_best=recover_feasible_only_best,
             popsize=popsize,
             sigma=sigma,
+            baseline_recover_candidates=collect_baseline_recover_candidates(
+                pool=baseline_action_pool,
+                target_limb_code=target_limb_code,
+                topk=inner_baseline_recover_topk if inner_include_baseline_recover else 0,
+                paired_sample=None if seed_metadata is None else seed_metadata.get('baseline_sample'),
+                include_pool=inner_include_baseline_recover,
+            ),
+        )
+        init_metadata['baseline_recover_candidate_count'] = max(
+            int(init_metadata['baseline_recover_candidate_count']),
+            int(recover_detail['search_diagnostics'].get('num_baseline_recover_candidates', 0)),
         )
 
         if recover_detail['status'] == 'valid_recover':
@@ -1059,6 +1324,8 @@ def optimize_uncover_sequential_joint(
                 'recover_reward': float(recover_detail['reward']),
                 'recover_f1': float(recover_detail['f1']),
                 'recover_success': True,
+                'recover_status': recover_detail['status'],
+                'exception_message': recover_detail.get('exception_message'),
                 'inner_num_evals': int(recover_detail['search_diagnostics']['num_evals']),
                 'inner_on_cloth_ratio': float(recover_detail['search_diagnostics']['on_cloth_ratio']),
                 'inner_best_reward': float(recover_detail['search_diagnostics']['best_reward']),
@@ -1071,6 +1338,8 @@ def optimize_uncover_sequential_joint(
                 'recover_reward': float(recover_detail['reward']),
                 'recover_f1': float(recover_detail.get('f1', np.nan)),
                 'recover_success': False,
+                'recover_status': recover_detail['status'],
+                'exception_message': recover_detail.get('exception_message'),
                 'inner_num_evals': int(recover_detail['search_diagnostics']['num_evals']),
                 'inner_on_cloth_ratio': float(recover_detail['search_diagnostics']['on_cloth_ratio']),
                 'inner_best_reward': float(recover_detail['search_diagnostics']['best_reward']),
@@ -1099,6 +1368,131 @@ def optimize_uncover_sequential_joint(
     es = cma.CMAEvolutionStrategy(x0.tolist(), float(sigma), opts)
 
     generation_idx = 0
+    if outer_init_source == 'baseline_limb_mixed':
+        requested_baseline = max(0, int(outer_baseline_seeds))
+        requested_random = max(0, int(outer_random_seeds))
+        if requested_baseline + requested_random <= 0:
+            requested_random = int(popsize)
+        baseline_seed_samples = select_outer_baseline_seed_samples(
+            pool=baseline_action_pool,
+            target_limb_code=target_limb_code,
+            num_seeds=requested_baseline,
+            selection_mode=baseline_seed_selection,
+            rng=rng,
+        )
+        seed_actions = []
+        seed_metadata = []
+        for sample in baseline_seed_samples:
+            seed_actions.append(np.asarray(sample['uncover_action'], dtype=np.float32))
+            seed_metadata.append({
+                'source': 'baseline',
+                'baseline_sample': sample,
+            })
+
+        max_seed_count = int(popsize)
+        remaining_slots = max(0, max_seed_count - len(seed_actions))
+        requested_random = max(requested_random, remaining_slots)
+        random_seed_count = min(max_seed_count - len(seed_actions), requested_random)
+        for _ in range(random_seed_count):
+            seed_actions.append(rng.uniform(-1.0, 1.0, size=4).astype(np.float32))
+            seed_metadata.append({
+                'source': 'random',
+                'baseline_sample': None,
+            })
+        while len(seed_actions) < max_seed_count:
+            seed_actions.append(rng.uniform(-1.0, 1.0, size=4).astype(np.float32))
+            seed_metadata.append({
+                'source': 'random',
+                'baseline_sample': None,
+            })
+
+        init_metadata['baseline_outer_seed_count'] = int(sum(1 for item in seed_metadata if item['source'] == 'baseline'))
+        init_metadata['random_outer_seed_count'] = int(sum(1 for item in seed_metadata if item['source'] == 'random'))
+        init_metadata['generation0_seed_details'] = [
+            {
+                'source': item['source'],
+                'action_policy': np.asarray(action, dtype=np.float32).copy(),
+                'baseline_filename': None if item['baseline_sample'] is None else item['baseline_sample']['filename'],
+                'baseline_reward': None if item['baseline_sample'] is None else float(item['baseline_sample']['best_reward']),
+                'baseline_seed': None if item['baseline_sample'] is None else int(item['baseline_sample']['seed']),
+            }
+            for action, item in zip(seed_actions, seed_metadata)
+        ]
+
+        if init_metadata['baseline_outer_seed_count'] == 0:
+            init_metadata['fallback_to_heuristic'] = True
+            print(
+                f"  Sequential init fallback to heuristic for TL {target_limb_code}: "
+                f"no usable baseline uncover seeds in {baseline_pool_summary['num_samples']} limb samples"
+            )
+        else:
+            print(
+                f"  Sequential init TL {target_limb_code}: source=baseline_limb_mixed "
+                f"baseline_outer={init_metadata['baseline_outer_seed_count']} "
+                f"random_outer={init_metadata['random_outer_seed_count']} "
+                f"limb_samples={baseline_pool_summary['num_samples']} "
+                f"unique_uncover={baseline_pool_summary['num_unique_uncover']}"
+            )
+
+        generation_idx += 1
+        eval_start = eval_counter
+        costs = []
+        asked_actions = es.ask()
+        if len(asked_actions) != len(seed_actions):
+            raise RuntimeError(
+                f'Seeded init population size mismatch: ask() returned {len(asked_actions)} actions, '
+                f'but constructed {len(seed_actions)} seed actions.'
+            )
+        for action, metadata in zip(seed_actions, seed_metadata):
+            reward = objective(np.asarray(action, dtype=np.float32), seed_metadata=metadata)
+            costs.append(float(-reward))
+        es.tell([np.asarray(action, dtype=np.float32) for action in seed_actions], costs)
+
+        generation_records = outer_trace[eval_start:eval_counter]
+        feasible_records = [record for record in generation_records if record['recover_success']]
+        gen_summary = {
+            'generation_idx': int(generation_idx),
+            'generation_type': 'seeded_init',
+            'eval_start_idx': int(eval_start + 1),
+            'eval_end_idx': int(eval_counter),
+            'num_evals': int(len(generation_records)),
+            'num_feasible': int(len(feasible_records)),
+            'feasible_ratio': float(len(feasible_records) / max(1, len(generation_records))),
+            'on_cloth_ratio': float(sum(1 for record in generation_records if record['is_on_cloth']) / max(1, len(generation_records))),
+            'mean_joint_reward': safe_mean([record['joint_reward'] for record in generation_records]),
+            'best_joint_reward_gen': float(max(record['joint_reward'] for record in generation_records)),
+            'best_joint_reward_so_far': float(best_detail['joint_reward']) if best_detail is not None else float(INVALID_REWARD),
+            'mean_uncover_f1': safe_mean([record['uncover_f1'] for record in generation_records]),
+            'best_uncover_f1_gen': float(max(record['uncover_f1'] for record in generation_records)),
+            'best_uncover_f1_so_far': float(best_detail['pred_uncover_f1']) if best_detail is not None else 0.0,
+            'mean_recover_reward_feasible': safe_mean([record['recover_reward'] for record in feasible_records]),
+            'mean_recover_f1_feasible': safe_mean([record['recover_f1'] for record in feasible_records if np.isfinite(record['recover_f1'])]),
+            'total_inner_evals': int(sum(record.get('inner_num_evals', 0) for record in generation_records)),
+            'sigma': float(es.sigma),
+            'baseline_outer_seed_count': int(init_metadata['baseline_outer_seed_count']),
+            'random_outer_seed_count': int(init_metadata['random_outer_seed_count']),
+        }
+        generation_summaries.append(gen_summary)
+        print(
+            f"  Sequential outer CMA gen {generation_idx:02d} [seeded]: evals {gen_summary['eval_start_idx']}-{gen_summary['eval_end_idx']} "
+            f"best_so_far={gen_summary['best_joint_reward_so_far']:.2f} "
+            f"gen_best={gen_summary['best_joint_reward_gen']:.2f} "
+            f"feasible={gen_summary['num_feasible']}/{gen_summary['num_evals']} "
+            f"mean_f1={gen_summary['mean_uncover_f1']:.3f} "
+            f"mean_r_f1={gen_summary['mean_recover_f1_feasible']:.3f} "
+            f"inner_total={gen_summary['total_inner_evals']} sigma={gen_summary['sigma']:.4f}"
+        )
+        for record in generation_records:
+            print(
+                f"    eval {record['eval_idx']:02d} src={record.get('init_source') or 'cma'} "
+                f"status={record['status']} uncover={record.get('uncover_status')} recover={record.get('recover_status')} "
+                f"u_r={record['uncover_reward']:.2f} u_f1={record['uncover_f1']:.3f} "
+                f"r_r={record['recover_reward']:.2f} r_f1={record['recover_f1']:.3f} "
+                f"base={record.get('baseline_filename')} "
+                f"exc={record.get('exception_message')}"
+            )
+        print(f"    seeded_init_cma_stop={es.stop()} countevals={es.countevals}")
+
     while not es.stop() and es.countevals < uncover_max_fevals:
         generation_idx += 1
         eval_start = eval_counter
@@ -1113,6 +1507,7 @@ def optimize_uncover_sequential_joint(
         feasible_records = [record for record in generation_records if record['recover_success']]
         gen_summary = {
             'generation_idx': int(generation_idx),
+            'generation_type': 'cma',
             'eval_start_idx': int(eval_start + 1),
             'eval_end_idx': int(eval_counter),
             'num_evals': int(len(generation_records)),
@@ -1152,6 +1547,15 @@ def optimize_uncover_sequential_joint(
         'outer_on_cloth_ratio': float(sum(1 for record in outer_trace if record['is_on_cloth']) / max(1, len(outer_trace))),
         'best_outer_eval_idx': int(best_detail['best_outer_eval_idx']),
         'total_inner_evals': int(sum(record.get('inner_num_evals', 0) for record in outer_trace)),
+        'outer_init_source': str(outer_init_source),
+        'baseline_outer_seed_count': int(init_metadata['baseline_outer_seed_count']),
+        'random_outer_seed_count': int(init_metadata['random_outer_seed_count']),
+        'baseline_recover_candidate_count': int(init_metadata['baseline_recover_candidate_count']),
+        'generation0_seed_details': init_metadata['generation0_seed_details'],
+        'fallback_to_heuristic': bool(init_metadata['fallback_to_heuristic']),
+        'baseline_limb_summary': init_metadata['baseline_limb_summary'],
+        'stop_reason': es.stop(),
+        'final_countevals': int(es.countevals),
         'trace': outer_trace,
         'generation_summaries': generation_summaries,
     }
@@ -1164,6 +1568,7 @@ def execute_rollout_sim(env, uncover_action_policy, recover_action_policy=None, 
     if execute_recover and recover_action_policy is not None:
         env.recover_step(recover_action_policy)
     else:
+        env.recover_action = np.zeros(4, dtype=np.float32)
         env.execute_recover_action = False
         env.cloth_final = env.cloth_intermediate
     observation, uncover_reward_sim, recover_reward_sim, done, info = env.get_info()
@@ -1177,7 +1582,35 @@ def execute_rollout_sim(env, uncover_action_policy, recover_action_policy=None, 
     }, sim_time
 
 
-def run_single_rollout(rollout_idx, args, uncover_model, recover_model, graph_config, env_variations, device, output_dir, rng):
+def build_failed_sim_payload(env, target_limb_code, fail_reason):
+    cloth_state = ensure_3d(np.asarray(env.get_cloth_state(), dtype=np.float32))
+    cloth_tuple = [None, cloth_state.copy()]
+    info = {
+        'recovering': True,
+        'cloth_initial': cloth_tuple,
+        'cloth_intermediate': [None, cloth_state.copy()],
+        'cloth_final': [None, cloth_state.copy()],
+        'RBG_human': getattr(env, 'human_no_occlusion_RGB', None),
+        'depth_human': getattr(env, 'human_no_occlusion_depth', None),
+        'uncovered_status_sim': None,
+        'recovered_status_sim': None,
+        'target_limb_code': int(target_limb_code),
+        'human_body_info': env.get_human_body_info(),
+        'gender': getattr(getattr(env, 'human', None), 'gender', None),
+        'grasp_on_cloth_uncover': False,
+        'grasp_on_cloth_recover': False,
+        'sim_skipped_reason': fail_reason,
+    }
+    return {
+        'observation': None,
+        'uncover reward': float(INVALID_REWARD),
+        'recover_reward': float(INVALID_REWARD),
+        'done': False,
+        'info': info,
+    }, 0.0
+
+
+def run_single_rollout(rollout_idx, args, uncover_model, recover_model, graph_config, env_variations, device, output_dir, rng, baseline_action_pool):
     load_runtime_dependencies()
     target_limb_code = args.target_limb_code if args.target_limb_code is not None else int(rng.choice(target_limb_list))
     seed = int(rng.randint(0, 2**31 - 1))
@@ -1242,6 +1675,14 @@ def run_single_rollout(rollout_idx, args, uncover_model, recover_model, graph_co
             recover_warm_start_strategy=args.recover_warm_start_strategy,
             recover_feasible_only_best=args.recover_feasible_only_best,
             screen_uncover_f1_threshold=args.screen_uncover_f1_threshold,
+            outer_init_source=args.outer_init_source,
+            baseline_action_pool=baseline_action_pool,
+            baseline_seed_selection=args.baseline_seed_selection,
+            outer_baseline_seeds=args.outer_baseline_seeds,
+            outer_random_seeds=args.outer_random_seeds,
+            inner_include_baseline_recover=args.inner_include_baseline_recover,
+            inner_baseline_recover_topk=args.inner_baseline_recover_topk,
+            rng=rng,
         )
         recover_action_policy = None if best_detail['recover_detail'] is None else best_detail['recover_detail']['action_policy']
         recover_search_diagnostics = None if best_detail['recover_detail'] is None else best_detail['recover_detail']['search_diagnostics']
@@ -1254,25 +1695,43 @@ def run_single_rollout(rollout_idx, args, uncover_model, recover_model, graph_co
         pred_recover_reward = float(best_detail['recover_reward'])
         pred_final = ensure_2d(best_detail['pred_final_3d'])
         best_eval_idx = int(search_diagnostics['best_eval_idx'])
+        no_valid_candidate = not np.isfinite(best_detail['joint_reward']) or best_detail['joint_reward'] <= INVALID_REWARD / 2.0
+        sim_skip_reason = None if not no_valid_candidate else f"no_valid_candidate:{best_detail['status']}"
     else:
         execute_recover = best_detail['recover_detail'] is not None and best_detail['recover_detail']['status'] == 'valid_recover'
         pred_recover_reward = float(best_detail['recover_detail']['reward']) if best_detail['recover_detail'] is not None else float(INVALID_REWARD)
         pred_final = ensure_2d(best_detail['recover_detail']['pred_final_3d']) if best_detail['recover_detail'] is not None else ensure_2d(best_detail['pred_intermediate_3d'])
         best_eval_idx = int(uncover_search_diagnostics['best_outer_eval_idx'])
+        no_valid_candidate = (
+            not np.isfinite(best_detail['joint_reward']) or
+            best_detail['joint_reward'] <= INVALID_REWARD / 2.0 or
+            int(uncover_search_diagnostics['num_feasible_outer']) == 0
+        )
+        sim_skip_reason = None if not no_valid_candidate else f"no_valid_candidate:{best_detail['status']}"
 
-    sim_info, sim_time = execute_rollout_sim(
-        env=env,
-        uncover_action_policy=best_detail['uncover_action_policy'],
-        recover_action_policy=recover_action_policy,
-        execute_recover=execute_recover,
-    )
-
-    sim_f1_metrics = compute_rollout_f1_metrics(
-        all_body_points=all_body_points,
-        cloth_initial=np.asarray(sim_info['info']['cloth_initial'][1]),
-        cloth_intermediate=np.asarray(sim_info['info']['cloth_intermediate'][1]),
-        cloth_final=np.asarray(sim_info['info']['cloth_final'][1]),
-    )
+    if sim_skip_reason is None:
+        sim_info, sim_time = execute_rollout_sim(
+            env=env,
+            uncover_action_policy=best_detail['uncover_action_policy'],
+            recover_action_policy=recover_action_policy,
+            execute_recover=execute_recover,
+        )
+        sim_f1_metrics = compute_rollout_f1_metrics(
+            all_body_points=all_body_points,
+            cloth_initial=np.asarray(sim_info['info']['cloth_initial'][1]),
+            cloth_intermediate=np.asarray(sim_info['info']['cloth_intermediate'][1]),
+            cloth_final=np.asarray(sim_info['info']['cloth_final'][1]),
+        )
+    else:
+        print(f"  Skipping final sim for rollout {rollout_idx}: {sim_skip_reason}")
+        sim_info, sim_time = build_failed_sim_payload(env, target_limb_code, sim_skip_reason)
+        sim_f1_metrics = {
+            'uncover_f1': float('nan'),
+            'recover_f1': float('nan'),
+            'initial_status': None,
+            'intermediate_status': None,
+            'final_status': None,
+        }
     pred_recover_f1 = (
         float(best_detail['recover_detail']['f1'])
         if args.optimization_mode == 'sequential' and best_detail['recover_detail'] is not None
@@ -1314,6 +1773,11 @@ def run_single_rollout(rollout_idx, args, uncover_model, recover_model, graph_co
             'outer_num_generations': int(uncover_search_diagnostics['num_generations']),
             'outer_num_evals': int(uncover_search_diagnostics['num_outer_evals']),
             'outer_feasible_ratio': float(uncover_search_diagnostics['outer_feasible_ratio']),
+            'outer_init_source': uncover_search_diagnostics['outer_init_source'],
+            'baseline_raw_dir': args.baseline_raw_dir,
+            'baseline_outer_seed_count': int(uncover_search_diagnostics['baseline_outer_seed_count']),
+            'random_outer_seed_count': int(uncover_search_diagnostics['random_outer_seed_count']),
+            'baseline_recover_candidate_count': int(uncover_search_diagnostics['baseline_recover_candidate_count']),
             'inner_num_evals_best': int(recover_search_diagnostics['num_evals']) if recover_search_diagnostics is not None else 0,
             'inner_on_cloth_ratio_best': float(recover_search_diagnostics['on_cloth_ratio']) if recover_search_diagnostics is not None else 0.0,
         })
@@ -1333,6 +1797,8 @@ def run_single_rollout(rollout_idx, args, uncover_model, recover_model, graph_co
         'sim_uncover_f1': float(sim_f1_metrics['uncover_f1']),
         'sim_recover_f1': float(sim_f1_metrics['recover_f1']),
         'pred_sim_recover_gap': float(pred_recover_reward - sim_info['recover_reward']),
+        'baseline_raw_dir': args.baseline_raw_dir,
+        'sim_skip_reason': sim_skip_reason,
     }
     if args.optimization_mode == 'coupled':
         diagnostics_payload['joint_search_diagnostics'] = search_diagnostics
@@ -1342,6 +1808,8 @@ def run_single_rollout(rollout_idx, args, uncover_model, recover_model, graph_co
             'best_uncover_action_policy': best_detail['uncover_action_policy'],
             'best_recover_action_policy': [] if recover_action_policy is None else np.asarray(recover_action_policy, dtype=np.float32),
             'status': best_detail['status'],
+            'init_source': best_detail.get('init_source'),
+            'baseline_filename': None if best_detail.get('baseline_sample') is None else best_detail['baseline_sample']['filename'],
         }
         diagnostics_payload['uncover_search_diagnostics'] = uncover_search_diagnostics
         diagnostics_payload['recover_search_diagnostics'] = recover_search_diagnostics
@@ -1380,6 +1848,7 @@ def run_single_rollout(rollout_idx, args, uncover_model, recover_model, graph_co
         'diagnostics_path': diagnostics_path,
         'optimizer_time': optimizer_time,
         'sim_time': sim_time,
+        'sim_skip_reason': sim_skip_reason,
     }
     if args.optimization_mode == 'coupled':
         result.update({
@@ -1392,6 +1861,9 @@ def run_single_rollout(rollout_idx, args, uncover_model, recover_model, graph_co
             'outer_feasible_ratio': float(uncover_search_diagnostics['outer_feasible_ratio']),
             'outer_num_generations': int(uncover_search_diagnostics['num_generations']),
             'outer_num_evals': int(uncover_search_diagnostics['num_outer_evals']),
+            'outer_init_source': uncover_search_diagnostics['outer_init_source'],
+            'baseline_outer_seed_count': int(uncover_search_diagnostics['baseline_outer_seed_count']),
+            'random_outer_seed_count': int(uncover_search_diagnostics['random_outer_seed_count']),
             'inner_num_evals_best': int(recover_search_diagnostics['num_evals']) if recover_search_diagnostics is not None else 0,
             'inner_total_evals': int(uncover_search_diagnostics['total_inner_evals']),
         })
@@ -1440,9 +1912,13 @@ def summarize_results(results, optimization_mode):
         feasible_ratio = np.array([r['outer_feasible_ratio'] for r in results], dtype=np.float32)
         outer_evals = np.array([r['outer_num_evals'] for r in results], dtype=np.float32)
         inner_evals = np.array([r['inner_total_evals'] for r in results], dtype=np.float32)
+        baseline_seed_counts = np.array([r['baseline_outer_seed_count'] for r in results], dtype=np.float32)
+        random_seed_counts = np.array([r['random_outer_seed_count'] for r in results], dtype=np.float32)
         print(f'Outer feasible ratio mean/std: {feasible_ratio.mean():.3f} / {feasible_ratio.std():.3f}')
         print(f'Outer evals mean/std: {outer_evals.mean():.2f} / {outer_evals.std():.2f}')
         print(f'Inner total evals mean/std: {inner_evals.mean():.2f} / {inner_evals.std():.2f}')
+        print(f'Baseline outer seed count mean/std: {baseline_seed_counts.mean():.2f} / {baseline_seed_counts.std():.2f}')
+        print(f'Random outer seed count mean/std: {random_seed_counts.mean():.2f} / {random_seed_counts.std():.2f}')
     print('=' * 80)
 
 
@@ -1468,9 +1944,18 @@ def main():
     parser.add_argument('--recover-search-method', type=str, default='cma', choices=['random', 'cma'])
     parser.add_argument('--recover-warm-start-strategy', type=str, default='reverse', choices=['none', 'reverse', 'field', 'hybrid'])
     parser.add_argument('--recover-feasible-only-best', action='store_true', help='Sequential mode: only pick recover best among on-cloth candidates when possible.')
+    parser.add_argument('--outer-init-source', type=str, default='heuristic', choices=['heuristic', 'baseline_limb_mixed'])
+    parser.add_argument('--baseline-raw-dir', type=str, default=None, help='Optional recover baseline raw dir used for sequential baseline-mixed initialization.')
+    parser.add_argument('--outer-baseline-seeds', type=int, default=4)
+    parser.add_argument('--outer-random-seeds', type=int, default=4)
+    parser.add_argument('--baseline-seed-selection', type=str, default='random', choices=['best_reward', 'random'])
+    parser.add_argument('--inner-include-baseline-recover', dest='inner_include_baseline_recover', action='store_true', help='Sequential mode: include same-limb baseline recover actions in inner warm-start candidates.')
+    parser.add_argument('--no-inner-include-baseline-recover', dest='inner_include_baseline_recover', action='store_false', help='Sequential mode: disable same-limb baseline recover warm-start candidates.')
+    parser.add_argument('--inner-baseline-recover-topk', type=int, default=1)
     parser.add_argument('--arg-seed', type=int, default=0)
     parser.add_argument('--target-limb-code', type=int, default=None)
     parser.add_argument('--output-dir', type=str, default=None)
+    parser.set_defaults(inner_include_baseline_recover=True)
     args = parser.parse_args()
 
     if args.uncover_model_path is None or args.recover_model_path is None:
@@ -1504,6 +1989,13 @@ def main():
             f'sequential_outer{uncover_max}_inner{recover_max}_{args.recover_search_method}_'
             f'{args.recover_warm_start_strategy}_u{args.uncover_weight}_r{args.recover_weight}'
         )
+        if args.outer_init_source != 'heuristic':
+            default_dir += (
+                f'_init-{args.outer_init_source}_{args.baseline_seed_selection}'
+                f'_b{args.outer_baseline_seeds}_rand{args.outer_random_seeds}'
+            )
+            if args.inner_include_baseline_recover:
+                default_dir += f'_innerb{args.inner_baseline_recover_topk}'
     output_dir = args.output_dir if args.output_dir is not None else osp.join(
         args.recover_model_path,
         'joint_evaluations',
@@ -1511,6 +2003,19 @@ def main():
     )
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     print(output_dir)
+
+    baseline_action_pool = None
+    if args.optimization_mode == 'sequential' and args.outer_init_source == 'baseline_limb_mixed':
+        if args.baseline_raw_dir is None:
+            raise ValueError('--baseline-raw-dir is required when --outer-init-source=baseline_limb_mixed')
+        baseline_action_pool = load_baseline_action_pool(args.baseline_raw_dir)
+        print(
+            f"Loaded baseline pool from {args.baseline_raw_dir}: "
+            f"loaded={baseline_action_pool['stats']['num_loaded']} files={baseline_action_pool['stats']['num_files']} "
+            f"bad_name={baseline_action_pool['stats']['num_skipped_bad_name']} "
+            f"read_error={baseline_action_pool['stats']['num_skipped_read_error']} "
+            f"invalid={baseline_action_pool['stats']['num_skipped_invalid_fields']}"
+        )
 
     rng = np.random.RandomState(args.arg_seed)
     results = []
@@ -1525,6 +2030,7 @@ def main():
             device=device,
             output_dir=output_dir,
             rng=rng,
+            baseline_action_pool=baseline_action_pool,
         )
         results.append(result)
         if args.optimization_mode == 'coupled':
@@ -1544,6 +2050,7 @@ def main():
                 f"pred_r={result['pred_recover_reward']:.2f} sim_r={result['sim_recover_reward']:.2f} "
                 f"u_f1={result['pred_uncover_f1']:.3f}/{result['sim_uncover_f1']:.3f} "
                 f"r_f1={result['pred_recover_f1']:.3f}/{result['sim_recover_f1']:.3f} "
+                f"init={result['outer_init_source']} bseed={result['baseline_outer_seed_count']} rseed={result['random_outer_seed_count']} "
                 f"best_outer={result['best_eval_idx']} "
                 f"outer={result['outer_num_evals']}evals inner_total={result['inner_total_evals']} "
                 f"opt={result['optimizer_time']:.2f}s sim={result['sim_time']:.2f}s"

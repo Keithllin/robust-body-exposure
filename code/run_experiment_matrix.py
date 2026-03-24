@@ -23,46 +23,96 @@ def resolve_output_dirs(run, outputs_root):
 
 
 def build_cmd(python_exec, run_robe_script, run, output_dir):
-    required = ["model_path", "graph_config", "env_var", "max_fevals", "num_rollouts"]
+    script_name = Path(run_robe_script).name
+    is_joint = "joint_opt" in script_name
+
+    required = ["graph_config", "env_var", "max_fevals", "num_rollouts"]
+    if is_joint:
+        required += ["uncover_model_path", "recover_model_path"]
+    else:
+        required += ["model_path"]
     missing = [k for k in required if k not in run]
     if missing:
         raise ValueError(f"Run {run.get('id','unknown')} missing required fields: {missing}")
 
-    search_method = str(run.get("search_method", "")).strip().lower()
-    if not search_method:
-        search_label = str(run.get("search", "RandomSearch")).strip().lower()
-        if "cma" in search_label:
-            search_method = "cma"
-        else:
-            search_method = "random"
+    cmd = [python_exec, str(run_robe_script)]
+    if is_joint:
+        cmd += [
+            "--uncover-model-path", str(run["uncover_model_path"]),
+            "--recover-model-path", str(run["recover_model_path"]),
+            "--graph-config", str(run["graph_config"]),
+            "--env-var", str(run["env_var"]),
+            "--max-fevals", str(run["max_fevals"]),
+            "--num-rollouts", str(run["num_rollouts"]),
+            "--output-dir", str(output_dir),
+        ]
+    else:
+        search_method = str(run.get("search_method", "")).strip().lower()
+        if not search_method:
+            search_label = str(run.get("search", "RandomSearch")).strip().lower()
+            if "cma" in search_label:
+                search_method = "cma"
+            else:
+                search_method = "random"
 
-    if search_method not in {"random", "cma"}:
-        raise ValueError(f"Run {run.get('id','unknown')} has invalid search_method={search_method}")
+        if search_method not in {"random", "cma"}:
+            raise ValueError(f"Run {run.get('id','unknown')} has invalid search_method={search_method}")
 
-    cmd = [
-        python_exec,
-        str(run_robe_script),
-        "--model-path", str(run["model_path"]),
-        "--graph-config", str(run["graph_config"]),
-        "--env-var", str(run["env_var"]),
-        "--max-fevals", str(run["max_fevals"]),
-        "--num-rollouts", str(run["num_rollouts"]),
-        "--search-method", search_method,
-        "--output-dir", str(output_dir),
-    ]
+        cmd += [
+            "--model-path", str(run["model_path"]),
+            "--graph-config", str(run["graph_config"]),
+            "--env-var", str(run["env_var"]),
+            "--max-fevals", str(run["max_fevals"]),
+            "--num-rollouts", str(run["num_rollouts"]),
+            "--search-method", search_method,
+            "--output-dir", str(output_dir),
+        ]
 
-    # Optional fields supported by current run_robe_sim_new_opt.py
-    if "warm_start_strategy" in run:
+    value_flags = {
+        "optimization_mode": "--optimization-mode",
+        "uncover_max_fevals": "--uncover-max-fevals",
+        "recover_max_fevals": "--recover-max-fevals",
+        "uncover_f1_threshold": "--uncover-f1-threshold",
+        "screen_uncover_f1_threshold": "--screen-uncover-f1-threshold",
+        "uncover_weight": "--uncover-weight",
+        "recover_weight": "--recover-weight",
+        "popsize": "--popsize",
+        "sigma": "--sigma",
+        "recover_search_method": "--recover-search-method",
+        "recover_warm_start_strategy": "--recover-warm-start-strategy",
+        "outer_init_source": "--outer-init-source",
+        "baseline_raw_dir": "--baseline-raw-dir",
+        "outer_baseline_seeds": "--outer-baseline-seeds",
+        "outer_random_seeds": "--outer-random-seeds",
+        "baseline_seed_selection": "--baseline-seed-selection",
+        "inner_baseline_recover_topk": "--inner-baseline-recover-topk",
+        "arg_seed": "--arg-seed",
+        "target_limb_code": "--target-limb-code",
+    }
+    for key, flag in value_flags.items():
+        if key in run and run[key] is not None:
+            cmd += [flag, str(run[key])]
+
+    bool_flags = {
+        "feasible_only_best": "--feasible-only-best",
+        "recover_feasible_only_best": "--recover-feasible-only-best",
+        "inner_include_baseline_recover": "--inner-include-baseline-recover",
+    }
+    for key, flag in bool_flags.items():
+        if bool(run.get(key, False)):
+            cmd.append(flag)
+
+    if run.get("inner_include_baseline_recover") is False and "inner_include_baseline_recover" in run:
+        cmd.append("--no-inner-include-baseline-recover")
+
+    if not is_joint and "warm_start_strategy" in run:
         cmd += ["--warm-start-strategy", str(run["warm_start_strategy"])]
-
-    if bool(run.get("feasible_only_best", False)):
-        cmd += ["--feasible-only-best"]
 
     return cmd
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run experiment matrix for run_robe_sim_new_opt.py")
+    parser = argparse.ArgumentParser(description="Run experiment matrix for run_robe_sim_new_opt.py or run_robe_sim_joint_opt.py")
     parser.add_argument("--matrix", required=True, help="Path to matrix json")
     parser.add_argument("--python", default="python", help="Python executable")
     parser.add_argument("--script", default="run_robe_sim_new_opt.py", help="Path to run_robe script")
