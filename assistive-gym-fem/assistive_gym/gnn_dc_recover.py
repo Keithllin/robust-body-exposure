@@ -1,10 +1,11 @@
-import sys, argparse, multiprocessing, time, os, math
+import sys, argparse, multiprocessing, time, os, math, json
 import numpy as np
 import pickle, pathlib
 import os.path as osp
 import random
 import glob
 import pybullet as p
+from collections import Counter, defaultdict
 # import pull_random_seeds
 from pathlib import Path
 
@@ -155,6 +156,223 @@ def sample_field_guided_recover_action(env, cloth_intermediate_sim, all_body_poi
         )
     return action_policy
 
+
+def policy_action_from_world(action_world):
+    scale = np.array([0.44, 1.05, 0.44, 1.05], dtype=np.float32)
+    return np.clip(np.asarray(action_world, dtype=np.float32) / scale, -1.0, 1.0)
+
+
+def compute_target_uncovered_points(all_body_points, cloth_intermediate_3d):
+    cloth_xy = np.asarray(cloth_intermediate_3d, dtype=np.float32)[:, :2]
+    covered_status = np.asarray(get_covered_status(all_body_points, cloth_xy))
+    body_points = np.asarray(all_body_points, dtype=np.float32)
+    return body_points[(covered_status[:, 0] == 1) & (covered_status[:, 1] == 0)]
+
+
+def build_overlap_candidates(
+    cloth_initial_3d,
+    cloth_intermediate_3d,
+    all_body_points,
+    grid_size=0.05,
+    min_count=3,
+    min_z_range=0.025,
+    min_top_sep=0.015,
+    relevance_sigma=0.16,
+):
+    cloth_initial = np.asarray(cloth_initial_3d, dtype=np.float32)
+    cloth = np.asarray(cloth_intermediate_3d, dtype=np.float32)
+    if cloth_initial.shape != cloth.shape:
+        raise RuntimeError(f"Initial/intermediate cloth shape mismatch: {cloth_initial.shape} != {cloth.shape}")
+
+    xy = cloth[:, :2]
+    xy_min = np.min(xy, axis=0)
+    cell_idx = np.floor((xy - xy_min[None, :]) / float(grid_size)).astype(np.int64)
+    groups = defaultdict(list)
+    for idx, cell in enumerate(cell_idx):
+        groups[(int(cell[0]), int(cell[1]))].append(idx)
+
+    target_uncovered = compute_target_uncovered_points(all_body_points, cloth)
+    candidates = []
+    for cell, indices in groups.items():
+        if len(indices) < int(min_count):
+            continue
+
+        local = cloth[indices]
+        local_z = local[:, 2]
+        local_z_range = float(np.max(local_z) - np.min(local_z))
+        if local_z_range < float(min_z_range):
+            continue
+
+        top_local_rank = int(np.argmax(local_z))
+        pick_vertex_idx = int(indices[top_local_rank])
+        top_layer_separation = float(local_z[top_local_rank] - np.median(local_z))
+        if top_layer_separation < float(min_top_sep):
+            continue
+
+        pick_xy = cloth[pick_vertex_idx, :2]
+        if len(target_uncovered) > 0:
+            dists = np.linalg.norm(target_uncovered[:, :2] - pick_xy[None, :], axis=1)
+            min_dist = float(np.min(dists))
+            recover_relevance = float(np.exp(-(min_dist ** 2) / (2.0 * float(relevance_sigma) ** 2)))
+        else:
+            min_dist = float('nan')
+            recover_relevance = 1.0
+
+        overlap_score = float(
+            local_z_range
+            * math.log1p(len(indices))
+            * max(top_layer_separation, 0.0)
+            * max(recover_relevance, 1e-6)
+        )
+        if overlap_score <= 0:
+            continue
+
+        candidates.append({
+            'cell': cell,
+            'indices': [int(v) for v in indices],
+            'pick_vertex_idx': pick_vertex_idx,
+            'local_point_count': int(len(indices)),
+            'local_z_range': local_z_range,
+            'top_layer_separation': top_layer_separation,
+            'recover_relevance': recover_relevance,
+            'nearest_target_uncovered_dist': min_dist,
+            'overlap_score': overlap_score,
+        })
+
+    return candidates
+
+
+def sample_overlap_guided_recover_action(
+    cloth_initial_sim,
+    cloth_intermediate_sim,
+    all_body_points,
+    grid_size=0.05,
+    min_count=3,
+    min_z_range=0.025,
+    min_top_sep=0.015,
+    initial_place_prob=0.7,
+    debug_log=False,
+):
+    cloth_initial = np.asarray(cloth_initial_sim[1], dtype=np.float32)
+    cloth_intermediate = np.asarray(cloth_intermediate_sim[1], dtype=np.float32)
+    candidates = build_overlap_candidates(
+        cloth_initial,
+        cloth_intermediate,
+        all_body_points,
+        grid_size=grid_size,
+        min_count=min_count,
+        min_z_range=min_z_range,
+        min_top_sep=min_top_sep,
+    )
+    if len(candidates) == 0:
+        return None, {'skip_reason': 'no_overlap_candidate', 'num_overlap_candidates': 0}
+
+    scores = np.asarray([candidate['overlap_score'] for candidate in candidates], dtype=np.float64)
+    probs = scores / np.sum(scores)
+
+    # Try several high-scoring stochastic candidates before giving up on grasp validity.
+    for _ in range(min(10, len(candidates))):
+        candidate = candidates[int(np.random.choice(len(candidates), p=probs))]
+        pick_vertex_idx = int(candidate['pick_vertex_idx'])
+        pick_xy = cloth_intermediate[pick_vertex_idx, :2] + np.random.normal(0.0, 0.005, size=2)
+
+        if random.random() < float(initial_place_prob):
+            place_xy = cloth_initial[pick_vertex_idx, :2].copy()
+            place_policy_used = 'initial_vertex'
+            if np.linalg.norm(place_xy - pick_xy) < 0.04:
+                place_policy_used = 'random_radial_short_initial'
+        else:
+            place_policy_used = 'random_radial'
+
+        if place_policy_used != 'initial_vertex':
+            theta = random.uniform(0.0, 2.0 * math.pi)
+            length = random.uniform(0.08, 0.30)
+            place_xy = pick_xy + length * np.array([math.cos(theta), math.sin(theta)], dtype=np.float32)
+
+        action_world = np.array([pick_xy[0], pick_xy[1], place_xy[0], place_xy[1]], dtype=np.float32)
+        action_policy = policy_action_from_world(action_world)
+        _, on_grasp = check_grasp_on_cloth(scale_action(action_policy), cloth_intermediate)
+        if not on_grasp:
+            continue
+
+        debug = {
+            'action_mode': 'overlap_guided',
+            'pick_vertex_idx': pick_vertex_idx,
+            'overlap_cell': [int(candidate['cell'][0]), int(candidate['cell'][1])],
+            'local_point_count': int(candidate['local_point_count']),
+            'local_z_range': float(candidate['local_z_range']),
+            'top_layer_separation': float(candidate['top_layer_separation']),
+            'overlap_score': float(candidate['overlap_score']),
+            'recover_relevance': float(candidate['recover_relevance']),
+            'nearest_target_uncovered_dist': float(candidate['nearest_target_uncovered_dist']),
+            'place_policy_used': place_policy_used,
+            'num_overlap_candidates': int(len(candidates)),
+            'action_world': action_world.tolist(),
+            'action_policy': action_policy.tolist(),
+        }
+        if debug_log:
+            print(
+                "[Overlap] pick_idx={pick_vertex_idx} cell={overlap_cell} "
+                "count={local_point_count} z_range={local_z_range:.4f} "
+                "top_sep={top_layer_separation:.4f} relevance={recover_relevance:.4f} "
+                "place={place_policy_used}".format(**debug)
+            )
+        return action_policy, debug
+
+    return None, {'skip_reason': 'overlap_pick_off_cloth', 'num_overlap_candidates': int(len(candidates))}
+
+
+def save_overlap_debug_image(image_path, cloth_initial, cloth_intermediate, cloth_final, data_info):
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"[OverlapImage] Failed to import matplotlib: {exc}")
+        return
+
+    cloth_initial = np.asarray(cloth_initial, dtype=np.float32)
+    cloth_intermediate = np.asarray(cloth_intermediate, dtype=np.float32)
+    cloth_final = np.asarray(cloth_final, dtype=np.float32)
+    action_world = np.asarray(data_info.get('action_world', [np.nan] * 4), dtype=np.float32)
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    states = [
+        ('initial', cloth_initial),
+        ('intermediate', cloth_intermediate),
+        ('final', cloth_final),
+    ]
+    for ax, (title, cloth) in zip(axes, states):
+        ax.scatter(cloth[:, 0], cloth[:, 1], c=cloth[:, 2], s=4, cmap='viridis', alpha=0.75)
+        ax.set_title(title)
+        ax.set_aspect('equal', adjustable='box')
+        ax.grid(True, alpha=0.2)
+    axes[1].scatter([action_world[0]], [action_world[1]], c='red', s=60, marker='x', label='pick')
+    axes[1].scatter([action_world[2]], [action_world[3]], c='orange', s=50, marker='o', label='place')
+    axes[1].arrow(
+        action_world[0],
+        action_world[1],
+        action_world[2] - action_world[0],
+        action_world[3] - action_world[1],
+        color='red',
+        width=0.003,
+        length_includes_head=True,
+    )
+    axes[1].legend(loc='best')
+    fig.suptitle(
+        "overlap_guided idx={idx} count={count} z_range={z:.3f} top_sep={sep:.3f} relevance={rel:.3f}".format(
+            idx=data_info.get('pick_vertex_idx'),
+            count=data_info.get('local_point_count'),
+            z=float(data_info.get('local_z_range', float('nan'))),
+            sep=float(data_info.get('top_layer_separation', float('nan'))),
+            rel=float(data_info.get('recover_relevance', float('nan'))),
+        )
+    )
+    Path(image_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(image_path, dpi=140)
+    plt.close(fig)
+
 def sample_action(env):
     return env.action_space.sample()
 
@@ -173,7 +391,25 @@ def find(seed):
                 return f
     raise Exception(f"Could not find seed file: {repr(seed)}")
 
-def gnn_data_collect(env_name, i, filename, seed, raw_data, action_mode='random', debug_field=False, render=False, debug_log=False):
+def gnn_data_collect(
+    env_name,
+    i,
+    filename,
+    seed,
+    raw_data,
+    action_mode='random',
+    debug_field=False,
+    render=False,
+    debug_log=False,
+    overlap_grid_size=0.05,
+    overlap_min_count=3,
+    overlap_min_z_range=0.025,
+    overlap_min_top_sep=0.015,
+    save_overlap_images=False,
+    overlap_image_dir=None,
+    uncover_post_release_steps=50,
+    recover_post_release_steps=50,
+):
     import gym
     from gym.utils import seeding
     from learn import make_env
@@ -184,8 +420,14 @@ def gnn_data_collect(env_name, i, filename, seed, raw_data, action_mode='random'
     on_grasp = False
     uncover_action = []
     recover_action = []
-    filename = []
+    source_filename = filename
     recover = True
+    data_collection_info = {
+        'action_mode': action_mode,
+        'source_uncover_pkl': source_filename,
+        'uncover_post_release_steps': int(uncover_post_release_steps),
+        'recover_post_release_steps': int(recover_post_release_steps),
+    }
 
     # set up seed
     if recover:
@@ -197,7 +439,7 @@ def gnn_data_collect(env_name, i, filename, seed, raw_data, action_mode='random'
         cloth_initial_dc = np.array(raw_data['info']['cloth_initial'][1])
         cloth_intermediate_dc = np.array(raw_data['info']['cloth_final'][1])
         if debug_log:
-            print(f"[Rollout {i}] source={filename}, seed={seed}, target_limb_code={target}, action_mode={action_mode}")
+            print(f"[Rollout {i}] source={source_filename}, seed={seed}, target_limb_code={target}, action_mode={action_mode}")
     else:
         seed = seeding.create_seed()
 
@@ -243,13 +485,41 @@ def gnn_data_collect(env_name, i, filename, seed, raw_data, action_mode='random'
         if not recover:
             uncover_action = sample_action(env)
 
+        if hasattr(env, 'set_release_sim_steps'):
+            env.set_release_sim_steps(post_release_steps=int(uncover_post_release_steps))
         cloth_initial_sim, cloth_intermediate_sim, execute_uncover_action = env.uncover_step(uncover_action)
 
         if not execute_uncover_action:
-            return [i, filename, pid]
+            return {'status': 'skipped', 'reason': 'uncover_not_executed', 'i': i, 'filename': source_filename, 'pid': pid}
 
         if recover:
-            if action_mode == 'field_guided':
+            if action_mode == 'overlap_guided':
+                recover_action, overlap_info = sample_overlap_guided_recover_action(
+                    cloth_initial_sim,
+                    cloth_intermediate_sim,
+                    all_body_points_now,
+                    grid_size=overlap_grid_size,
+                    min_count=overlap_min_count,
+                    min_z_range=overlap_min_z_range,
+                    min_top_sep=overlap_min_top_sep,
+                    debug_log=debug_log,
+                )
+                data_collection_info.update(overlap_info)
+                if recover_action is None:
+                    return {
+                        'status': 'skipped',
+                        'reason': overlap_info.get('skip_reason', 'overlap_action_not_found'),
+                        'i': i,
+                        'filename': source_filename,
+                        'pid': pid,
+                        'target_limb_code': int(target),
+                        'data_collection_info': data_collection_info,
+                    }
+                _, on_grasp = check_grasp_on_cloth(scale_action(recover_action), np.array(cloth_intermediate_sim[1]))
+                if debug_log:
+                    print(f"[Rollout {i}] overlap_guided grasp_on_cloth={on_grasp}")
+
+            elif action_mode == 'field_guided':
                 recover_action = sample_field_guided_recover_action(
                     env,
                     cloth_intermediate_sim,
@@ -263,27 +533,61 @@ def gnn_data_collect(env_name, i, filename, seed, raw_data, action_mode='random'
                         print(f"[Rollout {i}] field_guided grasp_on_cloth={on_grasp}")
 
             if recover_action is None or not on_grasp:
+                if action_mode == 'overlap_guided':
+                    return {
+                        'status': 'skipped',
+                        'reason': 'overlap_action_off_cloth',
+                        'i': i,
+                        'filename': source_filename,
+                        'pid': pid,
+                        'target_limb_code': int(target),
+                        'data_collection_info': data_collection_info,
+                    }
                 while not on_grasp:
                     recover_action = sample_action(env)
                     _, on_grasp = check_grasp_on_cloth(scale_action(recover_action), np.array(cloth_intermediate_sim[1]))
                 if debug_log and action_mode == 'field_guided':
                     print(f"[Rollout {i}] fallback=random (field action invalid/off-cloth)")
 
+        if hasattr(env, 'set_release_sim_steps'):
+            env.set_release_sim_steps(post_release_steps=int(recover_post_release_steps))
         cloth_final_sim, execute_recover_action = env.recover_step(recover_action)
         observation, uncover_reward, recover_reward, done, info = env.get_info()
+        data_collection_info['execute_recover_action'] = bool(execute_recover_action)
+        data_collection_info['target_limb_code'] = int(target)
+        data_collection_info['seed'] = int(seed)
 
         if not recover:
             recover_action = []
 
         filename = f"c_{target}_{seed}_{int(time.time()*1000)}"
+        if save_overlap_images and action_mode == 'overlap_guided' and overlap_image_dir is not None:
+            image_path = osp.join(overlap_image_dir, filename + '.png')
+            save_overlap_debug_image(
+                image_path,
+                cloth_initial_sim[1],
+                cloth_intermediate_sim[1],
+                cloth_final_sim[1],
+                data_collection_info,
+            )
+            data_collection_info['debug_image'] = image_path
+
         with open(osp.join(pkl_loc, filename +".pkl"),"wb") as f:
             pickle.dump({
                 "recovering":recover,
                 "observation":observation,
                 "info":info,
                 "uncover_action":uncover_action,
-                "recover_action":recover_action}, f)
-        output = [i, filename, pid]
+                "recover_action":recover_action,
+                "data_collection_info":data_collection_info}, f)
+        output = {
+            'status': 'saved',
+            'i': i,
+            'filename': filename,
+            'pid': pid,
+            'target_limb_code': int(target),
+            'data_collection_info': data_collection_info,
+        }
         return output
     finally:
         try:
@@ -292,9 +596,98 @@ def gnn_data_collect(env_name, i, filename, seed, raw_data, action_mode='random'
             pass
 
 def counter_callback(output):
-    global counter
+    global counter, saved_counter, collection_results
     counter += 1
-    print(f"{counter} - Trial Completed: {output[0]}, Worker: {os.getpid()}, Filename: {output[1]}")
+    if isinstance(output, dict):
+        collection_results.append(output)
+        if output.get('status') == 'saved':
+            saved_counter += 1
+        print(
+            f"{counter} - Trial {output.get('status', 'unknown')}: {output.get('i')}, "
+            f"Saved: {saved_counter}, Worker: {output.get('pid')}, "
+            f"Filename: {output.get('filename')}, Reason: {output.get('reason', '')}"
+        )
+    else:
+        saved_counter += 1
+        collection_results.append({'status': 'saved', 'i': output[0], 'filename': output[1], 'pid': output[2]})
+        print(f"{counter} - Trial Completed: {output[0]}, Saved: {saved_counter}, Worker: {os.getpid()}, Filename: {output[1]}")
+
+
+def summarize_collection_outputs(outputs):
+    saved = [out for out in outputs if out.get('status') == 'saved']
+    skipped = [out for out in outputs if out.get('status') != 'saved']
+    infos = [out.get('data_collection_info', {}) for out in saved]
+
+    def numeric_values(field):
+        vals = []
+        for info in infos:
+            if field not in info:
+                continue
+            try:
+                value = float(info[field])
+            except Exception:
+                continue
+            if np.isfinite(value):
+                vals.append(value)
+        return vals
+
+    def mean_field(field):
+        vals = numeric_values(field)
+        return float(np.mean(vals)) if vals else float('nan')
+
+    def median_field(field):
+        vals = numeric_values(field)
+        return float(np.median(vals)) if vals else float('nan')
+
+    summary = {
+        'attempted_count': int(len(outputs)),
+        'saved_count': int(len(saved)),
+        'skipped_count': int(len(skipped)),
+        'skip_reasons': dict(Counter(out.get('reason', 'unknown') for out in skipped)),
+        'saved_by_target_limb': dict(sorted(Counter(out.get('target_limb_code') for out in saved).items())),
+        'local_z_range_mean': mean_field('local_z_range'),
+        'local_z_range_median': median_field('local_z_range'),
+        'top_layer_separation_mean': mean_field('top_layer_separation'),
+        'top_layer_separation_median': median_field('top_layer_separation'),
+        'local_point_count_mean': mean_field('local_point_count'),
+        'overlap_score_mean': mean_field('overlap_score'),
+        'recover_relevance_mean': mean_field('recover_relevance'),
+        'execute_recover_rate': float(np.mean([bool(info.get('execute_recover_action')) for info in infos])) if infos else float('nan'),
+        'place_policy_counts': dict(Counter(info.get('place_policy_used', 'unknown') for info in infos)),
+    }
+    return summary
+
+
+def write_collection_summary(output_dir, summary, args):
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    payload = {
+        'summary': summary,
+        'args': vars(args),
+    }
+    with open(osp.join(output_dir, 'collection_summary.json'), 'w') as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write('\n')
+
+    lines = [
+        '# Recover Data Collection Summary',
+        '',
+        f"- action_mode: `{args.action_mode}`",
+        f"- uncover_post_release_steps: {getattr(args, 'uncover_post_release_steps', 50)}",
+        f"- recover_post_release_steps: {getattr(args, 'recover_post_release_steps', 50)}",
+        f"- attempted_count: {summary['attempted_count']}",
+        f"- saved_count: {summary['saved_count']}",
+        f"- skipped_count: {summary['skipped_count']}",
+        f"- skip_reasons: `{summary['skip_reasons']}`",
+        f"- saved_by_target_limb: `{summary['saved_by_target_limb']}`",
+        f"- local_z_range mean/median: {summary['local_z_range_mean']:.4f} / {summary['local_z_range_median']:.4f}",
+        f"- top_layer_separation mean/median: {summary['top_layer_separation_mean']:.4f} / {summary['top_layer_separation_median']:.4f}",
+        f"- local_point_count_mean: {summary['local_point_count_mean']:.2f}",
+        f"- execute_recover_rate: {summary['execute_recover_rate']:.3f}",
+        f"- place_policy_counts: `{summary['place_policy_counts']}`",
+        '',
+    ]
+    with open(osp.join(output_dir, 'collection_summary.md'), 'w') as handle:
+        handle.write('\n'.join(lines))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Data collection for gnn training')
@@ -302,15 +695,36 @@ if __name__ == "__main__":
     parser.add_argument('--num_seeds', type=int, default=100)
     parser.add_argument('--rollouts', type=int, default=10000)
     parser.add_argument('--target_limb_list', type=str, default='2, 4, 5, 8, 10, 11, 12, 13, 14, 15')
-    parser.add_argument('--action_mode', type=str, default='random', choices=['random', 'field_guided'])
+    parser.add_argument('--action_mode', type=str, default='random', choices=['random', 'field_guided', 'overlap_guided'])
     parser.add_argument('--uncover_f1_threshold', type=float, default=0.745)
     parser.add_argument('--debug_field', action='store_true')
     parser.add_argument('--debug_log', action='store_true')
     parser.add_argument('--render', action='store_true')
+    parser.add_argument('--overlap_grid_size', type=float, default=0.05)
+    parser.add_argument('--overlap_min_count', type=int, default=3)
+    parser.add_argument('--overlap_min_z_range', type=float, default=0.025)
+    parser.add_argument('--overlap_min_top_sep', type=float, default=0.015)
+    parser.add_argument('--overlap_max_attempts', type=int, default=None,
+                        help='Max source states to try for overlap_guided. Defaults to 5 * rollouts.')
+    parser.add_argument('--save_overlap_images', action='store_true',
+                        help='Save annotated overlap pick/place images for visual validation.')
+    parser.add_argument('--overlap_image_limit', type=int, default=100,
+                        help='Maximum overlap debug images to save.')
     parser.add_argument('--uncover_model_path', type=str, default=uncover_model_path)
     parser.add_argument('--eval_condition', type=str, default=eval_conditions[0])
+    parser.add_argument('--balance-target-limbs', action='store_true')
     parser.add_argument('--fallback_when_empty', type=str, default='topk', choices=['error', 'topk', 'all'])
     parser.add_argument('--fallback_topk', type=int, default=200)
+    parser.add_argument('--num-processes', type=int, default=4,
+                        help='Parallel PyBullet workers for data collection. Ignored when --render or --debug_field is set.')
+    parser.add_argument('--output-rollouts', type=int, default=None,
+                        help='Rollouts value used in output dataset directory name. Defaults to --rollouts.')
+    parser.add_argument('--uncover-post-release-steps', type=int, default=50,
+                        help='Post-release settle steps after uncover release.')
+    parser.add_argument('--recover-post-release-steps', type=int, default=50,
+                        help='Post-release settle steps after recover release.')
+    parser.add_argument('--output-dataset-dir', type=str, default=None,
+                        help='Override dataset output directory (parent of raw/). Defaults to auto-generated DATASETS/Recover_Data/<variation_type>.')
     args = parser.parse_args()
 
     target_limb_list = [int(item) for item in args.target_limb_list.split(',')]
@@ -318,6 +732,8 @@ if __name__ == "__main__":
         raise ValueError("--rollouts must be > 0")
     if args.num_seeds <= 0:
         raise ValueError("--num_seeds must be > 0")
+    if args.num_processes <= 0:
+        raise ValueError("--num-processes must be > 0")
 
     #seed_list = pull_random_seeds.random_seeds(args.num_seeds, target_limb_list)
 
@@ -328,17 +744,41 @@ if __name__ == "__main__":
     if recover:
         recover_string = 'Recover_Data'
 
-    variation_type = f'TL_All_{recover_string}_{args.num_seeds}_seeds_{args.rollouts}_fix_nullgrasp' # for uncovering states are the random actions, for recovering states are = num_seeds
-    pkl_loc = os.path.join(current_dir, "DATASETS",recover_string, variation_type, 'raw')
+    action_tag = '' if args.action_mode == 'random' else f'_{args.action_mode}'
+    rollouts_for_path = int(args.output_rollouts) if args.output_rollouts is not None else int(args.rollouts)
+    variation_type = f'TL_All_{recover_string}_{args.num_seeds}_seeds_{rollouts_for_path}_fix_nullgrasp{action_tag}' # for uncovering states are the random actions, for recovering states are = num_seeds
+    if args.output_dataset_dir:
+        output_dir = str(Path(args.output_dataset_dir).expanduser().resolve())
+    else:
+        output_dir = str(Path(current_dir) / 'DATASETS' / recover_string / variation_type)
+    pkl_loc = osp.join(output_dir, 'raw')
     pathlib.Path(pkl_loc).mkdir(parents=True, exist_ok=True)
+    overlap_image_dir = osp.join(output_dir, 'overlap_debug_images')
+    if args.save_overlap_images:
+        pathlib.Path(overlap_image_dir).mkdir(parents=True, exist_ok=True)
     np.warnings.filterwarnings('ignore', category=np.VisibleDeprecationWarning)
 
     counter = 0
-    trials = args.rollouts
+    saved_counter = 0
+    collection_results = []
+    requested_rollouts = args.rollouts
+    attempts_limit = args.rollouts
+    if args.action_mode == 'overlap_guided':
+        attempts_limit = int(args.overlap_max_attempts) if args.overlap_max_attempts is not None else int(args.rollouts * 5)
+        if attempts_limit < requested_rollouts:
+            raise ValueError("--overlap_max_attempts must be >= --rollouts")
+    trials = attempts_limit
     use_visual_debug = args.debug_field or args.render
-    num_processes = 1 if use_visual_debug else min(100, trials)
+    num_processes = 1 if use_visual_debug else min(args.num_processes, trials)
     if use_visual_debug:
         print('[Visual Debug] Enabling GUI render + single-process mode for visible PyBullet debug items.')
+    else:
+        print(f'[Parallel] Using {num_processes} worker process(es) (requested --num-processes={args.num_processes}).')
+    print(
+        f'[Release Steps] uncover_post_release_steps={args.uncover_post_release_steps} '
+        f'recover_post_release_steps={args.recover_post_release_steps}'
+    )
+    print(f'[Output] raw dir: {pkl_loc}')
     counter = 0
 
     # Resolve source uncover-eval files
@@ -373,11 +813,15 @@ if __name__ == "__main__":
 
     if len(all_scored_records) > 0:
         f1_vals = np.array([r[2] for r in all_scored_records])
+        scored_counts = Counter(int(r[1]['target_limb_code']) for r in all_scored_records)
+        pass_counts = Counter(int(r[1]['target_limb_code']) for r in eligible_records)
         print(
             f"[F1 Filter] total={len(source_files)}, scored={len(all_scored_records)}, failed={failed_records}, "
             f"threshold={args.uncover_f1_threshold}, pass={len(eligible_records)}, "
             f"f1[min/mean/max]={f1_vals.min():.3f}/{f1_vals.mean():.3f}/{f1_vals.max():.3f}"
         )
+        print(f"[F1 Filter] scored_by_target={dict(sorted(scored_counts.items()))}")
+        print(f"[F1 Filter] pass_by_target={dict(sorted(pass_counts.items()))}")
 
     if len(eligible_records) == 0:
         if len(all_scored_records) == 0:
@@ -393,8 +837,46 @@ if __name__ == "__main__":
             eligible_records = sorted(all_scored_records, key=lambda x: x[2], reverse=True)[:k]
             print(f"[F1 Filter] No records passed threshold. Falling back to TOP-{k} scored records.")
 
-    repeats = math.ceil(trials / len(eligible_records))
-    eligible_records = (eligible_records * repeats)[:trials]
+    eligible_records = [
+        record for record in eligible_records
+        if int(record[1]['target_limb_code']) in target_limb_list
+    ]
+    if len(eligible_records) == 0:
+        raise RuntimeError(f"No eligible records remain after target_limb_list filter: {target_limb_list}.")
+
+    if args.balance_target_limbs:
+        if attempts_limit < len(target_limb_list):
+            raise ValueError("--rollouts/attempts must be >= number of target limbs when --balance-target-limbs is set")
+
+        records_by_target = defaultdict(list)
+        for record in eligible_records:
+            records_by_target[int(record[1]['target_limb_code'])].append(record)
+
+        missing_targets = [tl for tl in target_limb_list if len(records_by_target[tl]) == 0]
+        if missing_targets:
+            raise RuntimeError(f"No eligible records for target limbs: {missing_targets}")
+
+        base_rollouts = attempts_limit // len(target_limb_list)
+        remainder = attempts_limit % len(target_limb_list)
+        balanced_records = []
+        balanced_counts = {}
+        for idx, target in enumerate(target_limb_list):
+            target_trials = base_rollouts + (1 if idx < remainder else 0)
+            records = records_by_target[target]
+            repeats = math.ceil(target_trials / len(records))
+            selected = (records * repeats)[:target_trials]
+            balanced_records.extend(selected)
+            balanced_counts[target] = len(selected)
+
+        random.Random(1001).shuffle(balanced_records)
+        eligible_records = balanced_records
+        print(f"[Target Balance] attempts={attempts_limit}, requested_saved={requested_rollouts}, by_target={dict(sorted(balanced_counts.items()))}")
+    else:
+        repeats = math.ceil(attempts_limit / len(eligible_records))
+        eligible_records = (eligible_records * repeats)[:attempts_limit]
+        final_counts = Counter(int(r[1]['target_limb_code']) for r in eligible_records)
+        print(f"[Target Balance] disabled, repeated_by_target={dict(sorted(final_counts.items()))}")
+
     filenames_iterated = iter(eligible_records)
     # dataset_path = '/home/kpputhuveetil/git/robe/robust-body-exposure/DATASETS/Recover_Data/TL_2, 4, 5, 8, 10, 11, 12, 13, 14, 15_Recover_Data_100_seeds_30000_states3/raw'
     # filenames_recover = list(Path(dataset_path).glob('*.pkl'))
@@ -432,7 +914,9 @@ if __name__ == "__main__":
     #         results = [result.get() for result in result_objs]
 
     if use_visual_debug:
-        for i in range(trials):
+        for i in range(attempts_limit):
+            if saved_counter >= requested_rollouts:
+                break
             filename, raw_data, uncover_f1 = next(filenames_iterated)
             seed = int(filename.name.split('_')[2])
             output = gnn_data_collect(
@@ -445,20 +929,61 @@ if __name__ == "__main__":
                 args.debug_field,
                 use_visual_debug,
                 args.debug_log,
+                args.overlap_grid_size,
+                args.overlap_min_count,
+                args.overlap_min_z_range,
+                args.overlap_min_top_sep,
+                args.save_overlap_images and saved_counter < args.overlap_image_limit,
+                overlap_image_dir,
+                args.uncover_post_release_steps,
+                args.recover_post_release_steps,
             )
             counter_callback(output)
     else:
-        for j in range(math.ceil(trials/num_processes)):
-            batch_size = min(num_processes, trials - j * num_processes)
+        attempts_started = 0
+        for j in range(math.ceil(attempts_limit/num_processes)):
+            if saved_counter >= requested_rollouts:
+                break
+            batch_size = min(num_processes, attempts_limit - attempts_started)
             with multiprocessing.Pool(processes=batch_size) as pool:
                 result_objs = []
                 for i in range(batch_size):
                     filename, raw_data, uncover_f1 = next(filenames_iterated)
                     seed = int(filename.name.split('_')[2])
+                    save_image = args.save_overlap_images and (saved_counter + len(result_objs)) < args.overlap_image_limit
                     result = pool.apply_async(
                         gnn_data_collect,
-                        args=(args.env, i, filename.name, seed, raw_data, args.action_mode, args.debug_field, use_visual_debug, args.debug_log),
+                        args=(
+                            args.env,
+                            attempts_started + i,
+                            filename.name,
+                            seed,
+                            raw_data,
+                            args.action_mode,
+                            args.debug_field,
+                            use_visual_debug,
+                            args.debug_log,
+                            args.overlap_grid_size,
+                            args.overlap_min_count,
+                            args.overlap_min_z_range,
+                            args.overlap_min_top_sep,
+                            save_image,
+                            overlap_image_dir,
+                            args.uncover_post_release_steps,
+                            args.recover_post_release_steps,
+                        ),
                         callback=counter_callback,
                     )
                     result_objs.append(result)
                 results = [result.get() for result in result_objs]
+            attempts_started += batch_size
+
+    summary = summarize_collection_outputs(collection_results)
+    write_collection_summary(output_dir, summary, args)
+    print(f"[Summary] wrote collection summary to {output_dir}")
+    print(f"[Summary] saved={summary['saved_count']} attempted={summary['attempted_count']} skipped={summary['skipped_count']}")
+    if args.action_mode == 'overlap_guided' and summary['saved_count'] < requested_rollouts:
+        raise RuntimeError(
+            f"Only saved {summary['saved_count']} overlap_guided samples after {summary['attempted_count']} attempts; "
+            f"requested {requested_rollouts}. Consider lowering overlap thresholds or increasing --overlap_max_attempts."
+        )

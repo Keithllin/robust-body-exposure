@@ -43,6 +43,14 @@ class RobeReversibleEnv(AssistiveEnv):
         self.max_threshold = .06
         self.line_threshold = .1
         self.release_threshold = .05
+        self.pre_release_steps = 20
+        self.post_release_steps = 50
+        self.quiet_settle_enabled = False
+        self.quiet_settle_speed_threshold = 0.15
+        self.quiet_settle_max_steps = 20
+        self.uncover_release_gravity_boost_enabled = False
+        self.uncover_release_gravity_z = -39.24
+        self.default_gravity_z = -9.81
 
         # cloth states
         self.cloth_initial = []
@@ -70,12 +78,21 @@ class RobeReversibleEnv(AssistiveEnv):
 
         self.naive = False
         self.clip = True
+        self.show_cloth_vertex_ids = False
 
         self.human_no_occlusion_RGB = None
         self.human_no_occlusion_depth = None
         self.point_cloud_initial = None
         self.point_cloud_final = None
         self.point_cloud_depth_img = None
+
+        # Optional diagnostics. Disabled by default so normal training/eval
+        # payloads do not grow.
+        self.record_cloth_trajectory = False
+        self.cloth_trajectory_stride = 1
+        self.cloth_trajectory_max_frames = 0
+        self.cloth_trajectory = []
+        self._cloth_trajectory_step = 0
 
         # seed values
         self.seed_val = None
@@ -102,6 +119,144 @@ class RobeReversibleEnv(AssistiveEnv):
         self.body_shape = None if self.body_shape_var == True else np.zeros((1, 10))
         self.gender = 'random' if self.body_shape_var == True else 'female'
 
+    def set_release_sim_steps(self, pre_release_steps=None, post_release_steps=None):
+        if pre_release_steps is not None:
+            self.pre_release_steps = max(0, int(pre_release_steps))
+        if post_release_steps is not None:
+            self.post_release_steps = max(0, int(post_release_steps))
+
+    def set_release_quiet_settle(self, enabled=None, speed_threshold=None, max_steps=None):
+        if enabled is not None:
+            self.quiet_settle_enabled = bool(enabled)
+        if speed_threshold is not None:
+            self.quiet_settle_speed_threshold = max(0.0, float(speed_threshold))
+        if max_steps is not None:
+            self.quiet_settle_max_steps = max(0, int(max_steps))
+
+    def set_uncover_release_gravity_boost(self, enabled=None, gravity_z=None):
+        if enabled is not None:
+            self.uncover_release_gravity_boost_enabled = bool(enabled)
+        if gravity_z is not None:
+            self.uncover_release_gravity_z = float(gravity_z)
+
+    def _get_cloth_mesh_positions(self):
+        return np.asarray(
+            p.getMeshData(
+                self.blanket,
+                -1,
+                flags=p.MESH_DATA_SIMULATION_MESH,
+                physicsClientId=self.id,
+            )[1],
+            dtype=np.float32,
+        )
+
+    def _cloth_vertex_speed_p95(self, prev_positions, curr_positions):
+        dt = max(self._physics_timestep(), 1e-8)
+        speed = np.linalg.norm(curr_positions - prev_positions, axis=1) / dt
+        return float(np.percentile(speed, 95))
+
+    def _run_post_release_settle(self, phase_name):
+        prev_positions = self._get_cloth_mesh_positions()
+        settle_iter = 0
+        max_steps = self.post_release_steps if not self.quiet_settle_enabled else max(
+            self.post_release_steps,
+            self.quiet_settle_max_steps,
+        )
+        boost_gravity = (
+            self.uncover_release_gravity_boost_enabled
+            and phase_name == "uncover_post_release_settle"
+        )
+        if boost_gravity:
+            p.setGravity(0, 0, self.uncover_release_gravity_z, physicsClientId=self.id)
+        try:
+            while settle_iter < max_steps:
+                settle_iter += 1
+                self._step_simulation_record_cloth(phase_name, settle_iter)
+                if not self.quiet_settle_enabled:
+                    if settle_iter >= self.post_release_steps:
+                        break
+                    continue
+
+                curr_positions = self._get_cloth_mesh_positions()
+                if settle_iter >= self.post_release_steps:
+                    speed_p95 = self._cloth_vertex_speed_p95(prev_positions, curr_positions)
+                    if speed_p95 <= self.quiet_settle_speed_threshold:
+                        break
+                prev_positions = curr_positions
+        finally:
+            if boost_gravity:
+                p.setGravity(0, 0, self.default_gravity_z, physicsClientId=self.id)
+
+    def set_cloth_trajectory_recording(self, enabled, stride=1, max_frames=0):
+        self.record_cloth_trajectory = bool(enabled)
+        self.cloth_trajectory_stride = max(1, int(stride))
+        self.cloth_trajectory_max_frames = max(0, int(max_frames))
+        self._reset_cloth_trajectory()
+
+    def _reset_cloth_trajectory(self):
+        self.cloth_trajectory = []
+        self._cloth_trajectory_step = 0
+
+    def _physics_timestep(self):
+        try:
+            params = p.getPhysicsEngineParameters(physicsClientId=self.id)
+            return float(params.get("fixedTimeStep", self.time_step))
+        except Exception:
+            return float(getattr(self, "time_step", 0.01))
+
+    def _record_cloth_trajectory_frame(self, phase, substep, note=None, force=False):
+        if not self.record_cloth_trajectory:
+            return
+        if self.cloth_trajectory_max_frames and len(self.cloth_trajectory) >= self.cloth_trajectory_max_frames:
+            return
+        if not force and (self._cloth_trajectory_step % self.cloth_trajectory_stride != 0):
+            return
+        try:
+            positions = np.asarray(
+                p.getMeshData(
+                    self.blanket,
+                    -1,
+                    flags=p.MESH_DATA_SIMULATION_MESH,
+                    physicsClientId=self.id,
+                )[1],
+                dtype=np.float32,
+            )
+        except Exception:
+            return
+        try:
+            sphere_pos = np.asarray(self.sphere_ee.get_base_pos_orient()[0], dtype=np.float32)
+        except Exception:
+            sphere_pos = None
+        try:
+            anchor_idx = [int(v) for v in list(self.anchor_idx)]
+        except Exception:
+            anchor_idx = []
+
+        self.cloth_trajectory.append({
+            "phase": str(phase),
+            "substep": int(substep),
+            "sim_step": int(self._cloth_trajectory_step),
+            "note": note,
+            "positions": positions,
+            "sphere_pos": sphere_pos,
+            "anchor_idx": anchor_idx,
+        })
+
+    def _step_simulation_record_cloth(self, phase, substep):
+        p.stepSimulation(physicsClientId=self.id)
+        self._cloth_trajectory_step += 1
+        self._record_cloth_trajectory_frame(phase, substep)
+
+    def _cloth_trajectory_payload(self):
+        if not self.cloth_trajectory:
+            return None
+        return {
+            "dt": self._physics_timestep(),
+            "stride": int(self.cloth_trajectory_stride),
+            "max_frames": int(self.cloth_trajectory_max_frames),
+            "frames": self.cloth_trajectory,
+        }
+
     def get_human_body_info(self):
         return self.human_creation.body_info if self.body_shape_var else None
 
@@ -118,6 +273,8 @@ class RobeReversibleEnv(AssistiveEnv):
 
         # * get points on the blanket, initial state of the cloth
         self.cloth_initial = p.getMeshData(self.blanket, -1, flags=p.MESH_DATA_SIMULATION_MESH, physicsClientId=self.id)
+        self._reset_cloth_trajectory()
+        self._record_cloth_trajectory_frame("uncover_initial", 0, note="pre-action", force=True)
         self.mesh = trimesh.load(os.path.join(self.directory, 'clothing', 'blanket_1061v.obj'))
 
         # create dict with all the connected vertices for one vertex
@@ -128,11 +285,12 @@ class RobeReversibleEnv(AssistiveEnv):
             self.mesh_dict[v1].append(v2)
             self.mesh_dict[v2].append(v1)
 
-        for i, v in enumerate(self.cloth_initial[1]):
-            color = [0, 0, 0]
-            if i in [527, 14, 394]:
-                color = [1, 0, 0]
-            p.addUserDebugText(text=str(i), textPosition=v, textColorRGB=color, textSize=1, lifeTime=0, physicsClientId=self.id)
+        if self.show_cloth_vertex_ids:
+            for i, v in enumerate(self.cloth_initial[1]):
+                color = [0, 0, 0]
+                if i in [527, 14, 394]:
+                    color = [1, 0, 0]
+                p.addUserDebugText(text=str(i), textPosition=v, textColorRGB=color, textSize=1, lifeTime=0, physicsClientId=self.id)
 
         # p.setGravity(0, 0, 0, physicsClientId=self.id)
 
@@ -181,9 +339,11 @@ class RobeReversibleEnv(AssistiveEnv):
             final_z = delta_z + bed_height           # global goal z position
 
             #Moves sphere up to the height
+            lift_iter = 0
             while current_pos[2] <= final_z:
                 self.sphere_ee.set_base_pos_orient(current_pos + np.array([0, 0, 0.005]), np.array([0,0,0]))
-                p.stepSimulation(physicsClientId=self.id)
+                lift_iter += 1
+                self._step_simulation_record_cloth("uncover_lift", lift_iter)
                 current_pos = self.sphere_ee.get_base_pos_orient()[0]
 
             # * move sphere to the release location, release the blanket
@@ -196,22 +356,39 @@ class RobeReversibleEnv(AssistiveEnv):
             current_pos = self.sphere_ee.get_base_pos_orient()[0]
 
             #Moves the sphere to the release location
-            for _ in range(int(num_steps)):
+            for translate_iter in range(1, int(num_steps) + 1):
                 delta_z = check_height_of_effector(np.array(current_pos), np.array(self.points_pos_limb_world), self.min_threshold, self.max_threshold, self.line_threshold)
                 self.sphere_ee.set_base_pos_orient(current_pos + np.array([delta_x, delta_y, delta_z]), np.array([0,0,0]))
-                p.stepSimulation(physicsClientId=self.id)
+                self._step_simulation_record_cloth("uncover_translate", translate_iter)
                 current_pos = self.sphere_ee.get_base_pos_orient()[0]
 
-            for _ in range(20):
-                p.stepSimulation(physicsClientId=self.id)
-            # * release the cloth at the release point, sphere is at the same arbitrary z position in the air
+            current_pos = self.sphere_ee.get_base_pos_orient()[0]
+            while True:
+                delta_z = release_height_of_effector(
+                    np.array(current_pos),
+                    np.array(self.points_pos_limb_world),
+                    self.release_threshold,
+                )
+                if delta_z >= -1e-6:
+                    break
+                self.sphere_ee.set_base_pos_orient(
+                    current_pos + np.array([0, 0, delta_z]),
+                    np.array([0,0,0]),
+                )
+                self._step_simulation_record_cloth("uncover_lower", 0)
+                current_pos = self.sphere_ee.get_base_pos_orient()[0]
+
+            for pre_release_iter in range(1, self.pre_release_steps + 1):
+                self._step_simulation_record_cloth("uncover_pre_release_settle", pre_release_iter)
+            # * release the cloth after lowering back to the original grasp height
             for i in constraint_ids:
                 p.removeConstraint(i, physicsClientId=self.id)
-            for _ in range(50):
-                p.stepSimulation(physicsClientId=self.id)
+            self._record_cloth_trajectory_frame("uncover_release", 0, note="constraints_removed", force=True)
+            self._run_post_release_settle("uncover_post_release_settle")
 
             # * get points on the blanket, intermediate state of the cloth
             self.cloth_intermediate = p.getMeshData(self.blanket, -1, flags=p.MESH_DATA_SIMULATION_MESH, physicsClientId=self.id)
+            self._record_cloth_trajectory_frame("uncover_intermediate", 0, note="post-uncover", force=True)
 
         return self.cloth_initial, self.cloth_intermediate, self.execute_uncover_action
 
@@ -270,9 +447,11 @@ class RobeReversibleEnv(AssistiveEnv):
             delta_z = 0.4                            # distance to move up (with respect to the top of the bed)
             bed_height = 0.58                        # height of the bed
             final_z = delta_z + bed_height           # global goal z position
+            lift_iter = 0
             while current_pos[2] <= final_z:
                 self.sphere_ee.set_base_pos_orient(current_pos + np.array([0, 0, 0.005]), np.array([0,0,0]))
-                p.stepSimulation(physicsClientId=self.id)
+                lift_iter += 1
+                self._step_simulation_record_cloth("recover_lift", lift_iter)
                 current_pos = self.sphere_ee.get_base_pos_orient()[0]
 
             # * move sphere to the release location, release the blanket
@@ -283,24 +462,38 @@ class RobeReversibleEnv(AssistiveEnv):
             delta_x, delta_y = travel_dist/num_steps
 
             current_pos = self.sphere_ee.get_base_pos_orient()[0]
-            for _ in range(int(num_steps)):
+            for translate_iter in range(1, int(num_steps) + 1):
                 self.sphere_ee.set_base_pos_orient(current_pos + np.array([delta_x, delta_y, 0]), np.array([0,0,0]))
-                p.stepSimulation(physicsClientId=self.id)
+                self._step_simulation_record_cloth("recover_translate", translate_iter)
                 current_pos = self.sphere_ee.get_base_pos_orient()[0]
 
             current_pos = self.sphere_ee.get_base_pos_orient()[0]
-            delta_z = release_height_of_effector(np.array(current_pos), np.array(self.points_pos_limb_world), self.release_threshold)
-            final_z = current_pos[2] + delta_z
-            while current_pos[2] >= final_z:
-                self.sphere_ee.set_base_pos_orient(current_pos - np.array([0, 0, 0.005]), np.array([0,0,0]))
-                p.stepSimulation(physicsClientId=self.id)
+            while True:
+                delta_z = release_height_of_effector(
+                    np.array(current_pos),
+                    np.array(self.points_pos_limb_world),
+                    self.release_threshold,
+                )
+                if delta_z >= -1e-6:
+                    break
+                self.sphere_ee.set_base_pos_orient(
+                    current_pos + np.array([0, 0, delta_z]),
+                    np.array([0,0,0]),
+                )
+                self._step_simulation_record_cloth("recover_lower", 0)
                 current_pos = self.sphere_ee.get_base_pos_orient()[0]
 
-            for _ in range(20):
-                p.stepSimulation(physicsClientId=self.id)
+            for pre_release_iter in range(1, self.pre_release_steps + 1):
+                self._step_simulation_record_cloth("recover_pre_release_settle", pre_release_iter)
+
+            for i in constraint_ids:
+                p.removeConstraint(i, physicsClientId=self.id)
+            self._record_cloth_trajectory_frame("recover_release", 0, note="constraints_removed", force=True)
+            self._run_post_release_settle("recover_post_release_settle")
 
         # * get points on the blanket, final state of the cloth
         self.cloth_final = p.getMeshData(self.blanket, -1, flags=p.MESH_DATA_SIMULATION_MESH, physicsClientId=self.id)
+        self._record_cloth_trajectory_frame("recover_final", 0, note="post-recover", force=True)
 
         return self.cloth_final, self.execute_recover_action
 
@@ -351,6 +544,10 @@ class RobeReversibleEnv(AssistiveEnv):
                 "gender":self.human.gender,
                 "all_body_points": all_body_points
                 }
+
+        cloth_trajectory = self._cloth_trajectory_payload()
+        if cloth_trajectory is not None:
+            info["cloth_trajectory"] = cloth_trajectory
 
         self.iteration += 1
         done = self.iteration >= 1
@@ -623,9 +820,6 @@ class RobeReversibleEnv(AssistiveEnv):
 
     def set_iteration(self, seed):
         self.iteration = seed
-
-
-
 
 
 
