@@ -12,11 +12,13 @@ from pathlib import Path
 from assistive_gym.envs.bu_gnn_util import scale_action, check_grasp_on_cloth, get_body_points_from_obs, get_covered_status
 from assistive_gym.envs.field_guided_policy import compute_field_guided_action
 
-# Base directory of the repo
-# REPO_ROOT = Path(__file__).resolve().parents[2]
-
-# uncover_model_path = str(REPO_ROOT / 'trained_models/FINAL_MODELS/Recover/TL_2, 4, 5, 8, 10, 11, 12, 13, 14, 15_Uncover_10000_states_New_Grasp_16000_epochs=250_batch=50_workers=4_1705905825')
-uncover_model_path = '/mnt/data/MudkipUsersSu2025/kpputhuveetil/git/robe/robust-body-exposure_unstable/trained_models/FINAL_MODELS/Recover/TL_2, 4, 5, 8, 10, 11, 12, 13, 14, 15_Uncover_10000_states_New_Grasp_16000_epochs=250_batch=50_workers=4_1705905825'
+# Base directory of the repository.  Callers can replace this model path
+# when evaluating a particular checkpoint.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+uncover_model_path = str(
+    REPO_ROOT
+    / 'trained_models/FINAL_MODELS/Recover/TL_2, 4, 5, 8, 10, 11, 12, 13, 14, 15_Uncover_10000_states_New_Grasp_16000_epochs=250_batch=50_workers=4_1705905825'
+)
 
 eval_dir_name = 'cma_evaluations'
 threshold = 0.745
@@ -78,6 +80,82 @@ def compute_uncover_f1_from_raw(raw_data):
     initial_status = get_covered_status(all_body_points, np.delete(cloth_initial, 2, axis=1))
     final_status = get_covered_status(all_body_points, np.delete(cloth_final, 2, axis=1))
     return compute_fscore_uncover_local(initial_status, final_status)
+
+
+def parse_seed_from_source_filename(filename):
+    name = Path(filename).name
+    parts = name.split('_')
+    if len(parts) >= 3 and parts[0].startswith('tl') and parts[2].isdigit():
+        return int(parts[2])
+    resolved = Path(filename).resolve().name
+    if resolved != name:
+        return parse_seed_from_source_filename(resolved)
+    raise ValueError(f"Cannot parse seed from source filename: {name}")
+
+
+def load_source_manifest(manifest_path, pool_root):
+    records = []
+    pool_root = Path(pool_root).expanduser().resolve()
+    with open(manifest_path, 'r') as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            rel_path = row.get('path')
+            filename = row.get('filename')
+            if rel_path:
+                src_path = (pool_root / rel_path).resolve()
+            else:
+                src_path = (pool_root / 'raw' / filename).resolve()
+            with open(src_path, 'rb') as rf:
+                raw = pickle.load(rf)
+            records.append((
+                src_path,
+                raw,
+                float(row.get('f1', compute_uncover_f1_from_raw(raw))),
+                row.get('quality_band', 'unknown'),
+            ))
+    return records
+
+
+def set_collection_rng(collection_seed, env=None):
+    """Seed only recover-action RNG. Do not call env.seed() here; sim uses source seed."""
+    seed = int(collection_seed)
+    random.seed(seed)
+    np.random.seed(seed % (2 ** 32 - 1))
+    if env is not None:
+        try:
+            env.action_space.seed(seed)
+        except Exception:
+            pass
+
+
+def count_saved_for_run(raw_dir, run_id):
+    raw_dir = Path(raw_dir)
+    if not raw_dir.exists():
+        return 0
+    prefix = f"{run_id}_"
+    return sum(1 for path in raw_dir.glob('*.pkl') if path.name.startswith(prefix))
+
+
+def load_existing_collection_seeds(raw_dir, run_id):
+    seeds = set()
+    raw_dir = Path(raw_dir)
+    prefix = f"{run_id}_"
+    for path in raw_dir.glob('*.pkl'):
+        if not path.name.startswith(prefix):
+            continue
+        parts = path.stem.split('_')
+        if parts and parts[-1].isdigit():
+            seeds.add(int(parts[-1]))
+    return seeds
+
+
+def cycle_records(records):
+    while True:
+        for record in records:
+            yield record
 
 
 def build_recover_reward_field(cloth_intermediate_3d, all_body_points, sigma_target=0.08, sigma_nontarget=0.06):
@@ -409,6 +487,10 @@ def gnn_data_collect(
     overlap_image_dir=None,
     uncover_post_release_steps=50,
     recover_post_release_steps=50,
+    collection_seed=None,
+    run_id='recover',
+    source_f1=None,
+    quality_band=None,
 ):
     import gym
     from gym.utils import seeding
@@ -427,7 +509,14 @@ def gnn_data_collect(
         'source_uncover_pkl': source_filename,
         'uncover_post_release_steps': int(uncover_post_release_steps),
         'recover_post_release_steps': int(recover_post_release_steps),
+        'run_id': str(run_id),
     }
+    if source_f1 is not None:
+        data_collection_info['source_uncover_f1'] = float(source_f1)
+    if quality_band is not None:
+        data_collection_info['source_quality_band'] = str(quality_band)
+    if collection_seed is not None:
+        data_collection_info['collection_seed'] = int(collection_seed)
 
     # set up seed
     if recover:
@@ -443,7 +532,7 @@ def gnn_data_collect(
     else:
         seed = seeding.create_seed()
 
-    # create environment
+    # create environment (make_env seeds env with source sim seed)
     env = make_env(env_name, coop=coop, seed=seed)
     try:
         if render:
@@ -493,6 +582,9 @@ def gnn_data_collect(
             return {'status': 'skipped', 'reason': 'uncover_not_executed', 'i': i, 'filename': source_filename, 'pid': pid}
 
         if recover:
+            if collection_seed is not None:
+                set_collection_rng(collection_seed, env)
+
             if action_mode == 'overlap_guided':
                 recover_action, overlap_info = sample_overlap_guided_recover_action(
                     cloth_initial_sim,
@@ -556,11 +648,23 @@ def gnn_data_collect(
         data_collection_info['execute_recover_action'] = bool(execute_recover_action)
         data_collection_info['target_limb_code'] = int(target)
         data_collection_info['seed'] = int(seed)
+        try:
+            anchor_idx = [int(v) for v in list(getattr(env, 'anchor_idx', []) or [])]
+        except Exception:
+            anchor_idx = list(info.get('anchor_idx', []) or [])
+        data_collection_info['anchor_idx'] = anchor_idx
+        data_collection_info['anchor_count'] = int(len(anchor_idx))
+        if isinstance(info, dict) and 'anchor_idx' not in info:
+            info['anchor_idx'] = anchor_idx
+            info['anchor_count'] = int(len(anchor_idx))
 
         if not recover:
             recover_action = []
 
-        filename = f"c_{target}_{seed}_{int(time.time()*1000)}"
+        if collection_seed is not None:
+            filename = f"{run_id}_c_{target}_{seed}_{int(collection_seed)}"
+        else:
+            filename = f"c_{target}_{seed}_{int(time.time()*1000)}"
         if save_overlap_images and action_mode == 'overlap_guided' and overlap_image_dir is not None:
             image_path = osp.join(overlap_image_dir, filename + '.png')
             save_overlap_debug_image(
@@ -645,6 +749,8 @@ def summarize_collection_outputs(outputs):
         'skipped_count': int(len(skipped)),
         'skip_reasons': dict(Counter(out.get('reason', 'unknown') for out in skipped)),
         'saved_by_target_limb': dict(sorted(Counter(out.get('target_limb_code') for out in saved).items())),
+        'saved_by_quality_band': dict(sorted(Counter(info.get('source_quality_band', 'unknown') for info in infos).items())),
+        'collection_seed_count': len(set(info.get('collection_seed') for info in infos if info.get('collection_seed') is not None)),
         'local_z_range_mean': mean_field('local_z_range'),
         'local_z_range_median': median_field('local_z_range'),
         'top_layer_separation_mean': mean_field('top_layer_separation'),
@@ -679,6 +785,8 @@ def write_collection_summary(output_dir, summary, args):
         f"- skipped_count: {summary['skipped_count']}",
         f"- skip_reasons: `{summary['skip_reasons']}`",
         f"- saved_by_target_limb: `{summary['saved_by_target_limb']}`",
+        f"- saved_by_quality_band: `{summary.get('saved_by_quality_band', {})}`",
+        f"- collection_seed_count: {summary.get('collection_seed_count', 0)}",
         f"- local_z_range mean/median: {summary['local_z_range_mean']:.4f} / {summary['local_z_range_median']:.4f}",
         f"- top_layer_separation mean/median: {summary['top_layer_separation_mean']:.4f} / {summary['top_layer_separation_median']:.4f}",
         f"- local_point_count_mean: {summary['local_point_count_mean']:.2f}",
@@ -725,6 +833,16 @@ if __name__ == "__main__":
                         help='Post-release settle steps after recover release.')
     parser.add_argument('--output-dataset-dir', type=str, default=None,
                         help='Override dataset output directory (parent of raw/). Defaults to auto-generated DATASETS/Recover_Data/<variation_type>.')
+    parser.add_argument('--run-id', type=str, default='recover',
+                        help='Run identifier embedded in output PKL names and metadata.')
+    parser.add_argument('--collection-seed-base', type=int, default=None,
+                        help='Base seed for recover action RNG. Each rollout uses base + rollout_index.')
+    parser.add_argument('--max-attempts', type=int, default=None,
+                        help='Maximum source replay attempts. Defaults to max(rollouts, 3 * rollouts) for random mode.')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume an interrupted run by counting existing PKLs for --run-id.')
+    parser.add_argument('--source-manifest', type=str, default=None,
+                        help='Optional source_manifest.jsonl from build_recover_source_pool.py.')
     args = parser.parse_args()
 
     target_limb_list = [int(item) for item in args.target_limb_list.split(',')]
@@ -762,14 +880,22 @@ if __name__ == "__main__":
     saved_counter = 0
     collection_results = []
     requested_rollouts = args.rollouts
-    attempts_limit = args.rollouts
-    if args.action_mode == 'overlap_guided':
+    if args.max_attempts is not None:
+        attempts_limit = int(args.max_attempts)
+    elif args.action_mode == 'overlap_guided':
         attempts_limit = int(args.overlap_max_attempts) if args.overlap_max_attempts is not None else int(args.rollouts * 5)
-        if attempts_limit < requested_rollouts:
-            raise ValueError("--overlap_max_attempts must be >= --rollouts")
-    trials = attempts_limit
+    else:
+        attempts_limit = max(int(args.rollouts), int(args.rollouts * 3))
+    if args.action_mode == 'overlap_guided' and attempts_limit < requested_rollouts:
+        raise ValueError("--overlap_max_attempts/--max-attempts must be >= --rollouts")
+    if args.collection_seed_base is None:
+        args.collection_seed_base = 1000000 if args.run_id == 'mudkip' else 2000000
     use_visual_debug = args.debug_field or args.render
-    num_processes = 1 if use_visual_debug else min(args.num_processes, trials)
+    num_processes = 1 if use_visual_debug else min(args.num_processes, attempts_limit)
+    if args.resume:
+        saved_counter = count_saved_for_run(pkl_loc, args.run_id)
+        print(f'[Resume] Found {saved_counter} existing saved PKLs for run_id={args.run_id}.')
+    existing_collection_seeds = load_existing_collection_seeds(pkl_loc, args.run_id) if args.resume else set()
     if use_visual_debug:
         print('[Visual Debug] Enabling GUI render + single-process mode for visible PyBullet debug items.')
     else:
@@ -779,49 +905,70 @@ if __name__ == "__main__":
         f'recover_post_release_steps={args.recover_post_release_steps}'
     )
     print(f'[Output] raw dir: {pkl_loc}')
+    print(f'[Run] run_id={args.run_id} collection_seed_base={args.collection_seed_base} max_attempts={attempts_limit}')
     counter = 0
 
-    # Resolve source uncover-eval files
-    data_path = osp.join(args.uncover_model_path, eval_dir_name, args.eval_condition, 'raw')
-    source_files = list(Path(data_path).glob('*.pkl'))
-
-    if len(source_files) == 0:
-        robe_root = Path(__file__).resolve().parents[3]
-        discovered = list(robe_root.glob(f"**/cma_evaluations/{args.eval_condition}/raw/*.pkl"))
-        if len(discovered) > 0:
-            source_files = discovered
-            print(f"[DataPath] Default path empty. Auto-discovered {len(source_files)} files for eval_condition={args.eval_condition}.")
+    manifest_path = None
+    pool_root = Path(args.uncover_model_path).expanduser().resolve()
+    if args.source_manifest:
+        manifest_path = Path(args.source_manifest).expanduser().resolve()
+        if manifest_path.parent.name == args.eval_condition:
+            pool_root = manifest_path.parents[2]
         else:
-            raise RuntimeError(
-                f"No source .pkl files found. Checked: {data_path} and auto-discovery under {robe_root} for eval_condition={args.eval_condition}."
-            )
+            pool_root = Path(args.uncover_model_path).expanduser().resolve()
+        manifest_records = load_source_manifest(manifest_path, pool_root)
+        all_scored_records = [(path, raw, f1) for path, raw, f1, _band in manifest_records]
+        eligible_records = [(path, raw, f1, band) for path, raw, f1, band in manifest_records]
+        failed_records = 0
+        print(f"[Source Manifest] loaded={len(eligible_records)} from {manifest_path}")
+    else:
+        # Resolve source uncover-eval files
+        data_path = osp.join(args.uncover_model_path, eval_dir_name, args.eval_condition, 'raw')
+        source_files = list(Path(data_path).glob('*.pkl'))
 
-    eligible_records = []
-    all_scored_records = []
-    failed_records = 0
-    for f in source_files:
-        with open(f, 'rb') as rf:
-            raw = pickle.load(rf)
-        try:
-            uncover_f1 = compute_uncover_f1_from_raw(raw)
-            all_scored_records.append((f, raw, uncover_f1))
-            if uncover_f1 >= args.uncover_f1_threshold:
-                eligible_records.append((f, raw, uncover_f1))
-        except Exception:
-            failed_records += 1
-            continue
+        if len(source_files) == 0:
+            robe_root = Path(__file__).resolve().parents[3]
+            discovered = list(robe_root.glob(f"**/cma_evaluations/{args.eval_condition}/raw/*.pkl"))
+            if len(discovered) > 0:
+                source_files = discovered
+                print(f"[DataPath] Default path empty. Auto-discovered {len(source_files)} files for eval_condition={args.eval_condition}.")
+            else:
+                raise RuntimeError(
+                    f"No source .pkl files found. Checked: {data_path} and auto-discovery under {robe_root} for eval_condition={args.eval_condition}."
+                )
 
-    if len(all_scored_records) > 0:
+        eligible_records = []
+        all_scored_records = []
+        failed_records = 0
+        for f in source_files:
+            real_path = f.resolve()
+            with open(real_path, 'rb') as rf:
+                raw = pickle.load(rf)
+            try:
+                uncover_f1 = compute_uncover_f1_from_raw(raw)
+                all_scored_records.append((real_path, raw, uncover_f1))
+                if uncover_f1 >= args.uncover_f1_threshold:
+                    eligible_records.append((real_path, raw, uncover_f1, 'high'))
+            except Exception:
+                failed_records += 1
+                continue
+
+    if len(all_scored_records) > 0 and not args.source_manifest:
         f1_vals = np.array([r[2] for r in all_scored_records])
         scored_counts = Counter(int(r[1]['target_limb_code']) for r in all_scored_records)
         pass_counts = Counter(int(r[1]['target_limb_code']) for r in eligible_records)
         print(
-            f"[F1 Filter] total={len(source_files)}, scored={len(all_scored_records)}, failed={failed_records}, "
+            f"[F1 Filter] total={len(all_scored_records)}, scored={len(all_scored_records)}, failed={failed_records}, "
             f"threshold={args.uncover_f1_threshold}, pass={len(eligible_records)}, "
             f"f1[min/mean/max]={f1_vals.min():.3f}/{f1_vals.mean():.3f}/{f1_vals.max():.3f}"
         )
         print(f"[F1 Filter] scored_by_target={dict(sorted(scored_counts.items()))}")
         print(f"[F1 Filter] pass_by_target={dict(sorted(pass_counts.items()))}")
+    elif args.source_manifest:
+        band_counts = Counter(r[3] for r in eligible_records)
+        by_target = Counter(int(r[1]['target_limb_code']) for r in eligible_records)
+        print(f"[Source Manifest] quality_band_counts={dict(sorted(band_counts.items()))}")
+        print(f"[Source Manifest] by_target={dict(sorted(by_target.items()))}")
 
     if len(eligible_records) == 0:
         if len(all_scored_records) == 0:
@@ -831,10 +978,13 @@ if __name__ == "__main__":
             raise RuntimeError(f"No source uncover states passed F1 threshold {args.uncover_f1_threshold}.")
         elif args.fallback_when_empty == 'all':
             print("[F1 Filter] No records passed threshold. Falling back to ALL scored records.")
-            eligible_records = all_scored_records
+            eligible_records = [(path, raw, f1, 'fallback') for path, raw, f1 in all_scored_records]
         else:
             k = max(1, min(args.fallback_topk, len(all_scored_records)))
-            eligible_records = sorted(all_scored_records, key=lambda x: x[2], reverse=True)[:k]
+            eligible_records = [
+                (path, raw, f1, 'fallback')
+                for path, raw, f1 in sorted(all_scored_records, key=lambda x: x[2], reverse=True)[:k]
+            ]
             print(f"[F1 Filter] No records passed threshold. Falling back to TOP-{k} scored records.")
 
     eligible_records = [
@@ -844,112 +994,119 @@ if __name__ == "__main__":
     if len(eligible_records) == 0:
         raise RuntimeError(f"No eligible records remain after target_limb_list filter: {target_limb_list}.")
 
+    records_by_target = defaultdict(list)
+    for record in eligible_records:
+        records_by_target[int(record[1]['target_limb_code'])].append(record)
+
+    missing_targets = [tl for tl in target_limb_list if len(records_by_target[tl]) == 0]
+    if missing_targets:
+        raise RuntimeError(f"No eligible records for target limbs: {missing_targets}")
+
+    target_quota = requested_rollouts // len(target_limb_list)
+    saved_by_target = Counter()
+    if args.resume and saved_counter > 0:
+        for path in Path(pkl_loc).glob(f"{args.run_id}_*.pkl"):
+            try:
+                with open(path, 'rb') as handle:
+                    payload = pickle.load(handle)
+                tl = int(payload.get('data_collection_info', {}).get('target_limb_code', payload.get('info', {}).get('target_limb_code', -1)))
+                if tl in target_limb_list:
+                    saved_by_target[tl] += 1
+            except Exception:
+                continue
+
+    target_iterators = {tl: cycle_records(records_by_target[tl]) for tl in target_limb_list}
+    flat_iterator = cycle_records(eligible_records)
+
+    def quotas_met():
+        if not args.balance_target_limbs:
+            return saved_counter >= requested_rollouts
+        return all(saved_by_target[tl] >= target_quota for tl in target_limb_list)
+
+    def pick_next_record():
+        if args.balance_target_limbs:
+            candidates = [tl for tl in target_limb_list if saved_by_target[tl] < target_quota]
+            if not candidates:
+                return None
+            target = min(candidates, key=lambda tl: saved_by_target[tl])
+            return next(target_iterators[target])
+        return next(flat_iterator)
+
+    rollout_state = {'index': 0}
+
+    def next_collection_seed():
+        while True:
+            candidate = int(args.collection_seed_base) + rollout_state['index']
+            rollout_state['index'] += 1
+            if candidate not in existing_collection_seeds:
+                return candidate
+
     if args.balance_target_limbs:
-        if attempts_limit < len(target_limb_list):
-            raise ValueError("--rollouts/attempts must be >= number of target limbs when --balance-target-limbs is set")
-
-        records_by_target = defaultdict(list)
-        for record in eligible_records:
-            records_by_target[int(record[1]['target_limb_code'])].append(record)
-
-        missing_targets = [tl for tl in target_limb_list if len(records_by_target[tl]) == 0]
-        if missing_targets:
-            raise RuntimeError(f"No eligible records for target limbs: {missing_targets}")
-
-        base_rollouts = attempts_limit // len(target_limb_list)
-        remainder = attempts_limit % len(target_limb_list)
-        balanced_records = []
-        balanced_counts = {}
-        for idx, target in enumerate(target_limb_list):
-            target_trials = base_rollouts + (1 if idx < remainder else 0)
-            records = records_by_target[target]
-            repeats = math.ceil(target_trials / len(records))
-            selected = (records * repeats)[:target_trials]
-            balanced_records.extend(selected)
-            balanced_counts[target] = len(selected)
-
-        random.Random(1001).shuffle(balanced_records)
-        eligible_records = balanced_records
-        print(f"[Target Balance] attempts={attempts_limit}, requested_saved={requested_rollouts}, by_target={dict(sorted(balanced_counts.items()))}")
+        print(
+            f"[Target Balance] requested_saved={requested_rollouts}, quota_per_limb={target_quota}, "
+            f"source_pool_by_target={dict(sorted(Counter(int(r[1]['target_limb_code']) for r in eligible_records).items()))}, "
+            f"resume_saved_by_target={dict(sorted(saved_by_target.items()))}"
+        )
     else:
-        repeats = math.ceil(attempts_limit / len(eligible_records))
-        eligible_records = (eligible_records * repeats)[:attempts_limit]
-        final_counts = Counter(int(r[1]['target_limb_code']) for r in eligible_records)
-        print(f"[Target Balance] disabled, repeated_by_target={dict(sorted(final_counts.items()))}")
+        print(f"[Target Balance] disabled, source_pool_size={len(eligible_records)}")
 
-    filenames_iterated = iter(eligible_records)
-    # dataset_path = '/home/kpputhuveetil/git/robe/robust-body-exposure/DATASETS/Recover_Data/TL_2, 4, 5, 8, 10, 11, 12, 13, 14, 15_Recover_Data_100_seeds_30000_states3/raw'
-    # filenames_recover = list(Path(dataset_path).glob('*.pkl'))
+    def run_one_trial(trial_index):
+        if quotas_met() or saved_counter >= requested_rollouts:
+            return None
+        filename, raw_data, uncover_f1, quality_band = pick_next_record()
+        seed = parse_seed_from_source_filename(filename)
+        collection_seed = next_collection_seed()
+        return gnn_data_collect(
+            args.env,
+            trial_index,
+            filename.name,
+            seed,
+            raw_data,
+            args.action_mode,
+            args.debug_field,
+            use_visual_debug,
+            args.debug_log,
+            args.overlap_grid_size,
+            args.overlap_min_count,
+            args.overlap_min_z_range,
+            args.overlap_min_top_sep,
+            args.save_overlap_images and saved_counter < args.overlap_image_limit,
+            overlap_image_dir,
+            args.uncover_post_release_steps,
+            args.recover_post_release_steps,
+            collection_seed=collection_seed,
+            run_id=args.run_id,
+            source_f1=uncover_f1,
+            quality_band=quality_band,
+        )
 
-    # processed = {}
-    # for filename in filenames_recover:
-    #     target = int(filename.name.split('_')[1])
-    #     seed = int(filename.name.split('_')[2])
-
-    #     if (target, seed) not in processed:
-    #         processed[(target, seed)] = 0
-    #     processed[(target, seed)] += 1
-
-    # filenames_iterated = []
-    # for filename in filenames * 10:
-    #     target = int(filename.name.split('_')[0][2:])
-    #     seed = int(filename.name.split('_')[2])
-    #     if (target, seed) in processed and processed[(target, seed)] > 0:
-    #         processed[(target, seed)] -= 1
-    #         continue
-    #     filenames_iterated.append(filename)
-    # trials = len(filenames_iterated)
-
-    # filename_index = 0
-    # for j in range(math.ceil(trials/num_processes)):
-    #     with multiprocessing.Pool(processes=num_processes) as pool:
-    #         for i in range(num_processes): #(min(num_processes, trials - filename_index)):
-    #             filename = next(filenames_iterated) #filenames_iterated[filename_index]
-    #             # filename_index += 1
-    #             with open(filename, 'rb') as f:
-    #                 raw_data = pickle.load(f)
-    #                 seed = int(filename.name.split('_')[2])
-    #             result = pool.apply_async(gnn_data_collect, args = (args.env, i, filename.name, seed, raw_data), callback=counter_callback)
-    #             result_objs.append(result)
-    #         results = [result.get() for result in result_objs]
+    def handle_output(output):
+        if isinstance(output, dict) and output.get('status') == 'saved':
+            tl = output.get('target_limb_code')
+            if tl is not None:
+                saved_by_target[int(tl)] += 1
+        counter_callback(output)
 
     if use_visual_debug:
-        for i in range(attempts_limit):
-            if saved_counter >= requested_rollouts:
+        attempts_started = 0
+        while attempts_started < attempts_limit and saved_counter < requested_rollouts and not quotas_met():
+            output = run_one_trial(attempts_started)
+            if output is None:
                 break
-            filename, raw_data, uncover_f1 = next(filenames_iterated)
-            seed = int(filename.name.split('_')[2])
-            output = gnn_data_collect(
-                args.env,
-                i,
-                filename.name,
-                seed,
-                raw_data,
-                args.action_mode,
-                args.debug_field,
-                use_visual_debug,
-                args.debug_log,
-                args.overlap_grid_size,
-                args.overlap_min_count,
-                args.overlap_min_z_range,
-                args.overlap_min_top_sep,
-                args.save_overlap_images and saved_counter < args.overlap_image_limit,
-                overlap_image_dir,
-                args.uncover_post_release_steps,
-                args.recover_post_release_steps,
-            )
-            counter_callback(output)
+            handle_output(output)
+            attempts_started += 1
     else:
         attempts_started = 0
-        for j in range(math.ceil(attempts_limit/num_processes)):
-            if saved_counter >= requested_rollouts:
-                break
+        while attempts_started < attempts_limit and saved_counter < requested_rollouts and not quotas_met():
             batch_size = min(num_processes, attempts_limit - attempts_started)
             with multiprocessing.Pool(processes=batch_size) as pool:
                 result_objs = []
                 for i in range(batch_size):
-                    filename, raw_data, uncover_f1 = next(filenames_iterated)
-                    seed = int(filename.name.split('_')[2])
+                    if saved_counter >= requested_rollouts or quotas_met():
+                        break
+                    filename, raw_data, uncover_f1, quality_band = pick_next_record()
+                    seed = parse_seed_from_source_filename(filename)
+                    collection_seed = next_collection_seed()
                     save_image = args.save_overlap_images and (saved_counter + len(result_objs)) < args.overlap_image_limit
                     result = pool.apply_async(
                         gnn_data_collect,
@@ -971,12 +1128,22 @@ if __name__ == "__main__":
                             overlap_image_dir,
                             args.uncover_post_release_steps,
                             args.recover_post_release_steps,
+                            collection_seed,
+                            args.run_id,
+                            uncover_f1,
+                            quality_band,
                         ),
-                        callback=counter_callback,
+                        callback=handle_output,
                     )
                     result_objs.append(result)
                 results = [result.get() for result in result_objs]
-            attempts_started += batch_size
+            attempts_started += len(result_objs)
+
+    if saved_counter < requested_rollouts:
+        print(
+            f"[Warning] Saved {saved_counter}/{requested_rollouts} after {attempts_started} attempts. "
+            f"Consider increasing --max-attempts or rerunning with --resume."
+        )
 
     summary = summarize_collection_outputs(collection_results)
     write_collection_summary(output_dir, summary, args)

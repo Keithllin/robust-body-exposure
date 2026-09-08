@@ -6,11 +6,14 @@ import numpy as np
 from numpy.lib import index_tricks
 import pandas as pd
 import math
+from pathlib import Path
 
 import torch, torch_geometric
 from torch_geometric.data import Dataset, Data
+from scipy.spatial import cKDTree
 
 from tqdm import tqdm
+from voxel_ops import voxelize_xyz_state_pair
 
 # sys.path.insert(1, '/home/kpputhuveetil/git/vBM-GNNs/assistive-gym-fem/assistive_gym/envs')
 # from bu_gnn_util import sub_sample_point_clouds
@@ -23,7 +26,11 @@ from tqdm import tqdm
 
 class BMDataset(Dataset):
     def __init__(self, root, description, transform=None, pre_transform=None, recover=None, voxel_size=float('NaN'), edge_threshold=0.06, action_to_all=True,
-    use_cma_data=False, testing=False, use_displacement=True, filter_draping = False, use_3D = False, rot_draping=False):
+    use_cma_data=False, testing=False, use_displacement=True, filter_draping = False, use_3D = False, rot_draping=False,
+    process_workers=None, edge_mode='radius', action_mode='broadcast',
+    use_oracle_anchor=False, singulate_layers=True, layer_bit_mode='none',
+    layer_labels_path=None, layer_shuffle_map_path=None, sample_ids=None,
+    manifest_path=None):
         """
         root is where the data should be stored (data). The directory is split into "raw" and 'preprocessed' directories
         raw folder contains original pickle files
@@ -37,21 +44,67 @@ class BMDataset(Dataset):
         self.testing = testing
         self.use_displacement = use_displacement
         self.filter_draping = filter_draping      #! add condition so you can't choose to both rotate and filter
+        self.use_3D = bool(use_3D)
         self.cloth_dim = 2 if not use_3D else 3
         self.rot_draping = rot_draping
+        self.edge_mode = str(edge_mode).strip().lower()
+        if self.edge_mode not in ('radius', 'mesh'):
+            raise ValueError("edge_mode must be 'radius' or 'mesh'")
+        if self.edge_mode == 'mesh' and self.subsample:
+            raise ValueError(
+                'edge_mode=mesh requires voxel_size=nan so cloth vertex '
+                'indices stay aligned with the GT mesh.'
+            )
+        self.action_mode = str(action_mode).strip().lower()
+        if self.action_mode not in ('broadcast',):
+            raise ValueError(
+                "BMDataset supports action_mode='broadcast'; "
+                'oracle action features require a dedicated labeled dataset.'
+            )
+        if use_oracle_anchor or str(layer_bit_mode).strip().lower() != 'none':
+            raise ValueError(
+                'oracle anchor/layer-bit training is not part of the core '
+                'Recover dataset contract.'
+            )
+        self.use_oracle_anchor = bool(use_oracle_anchor)
+        self.singulate_layers = bool(singulate_layers)
+        self.layer_bit_mode = str(layer_bit_mode).strip().lower()
+        self.layer_labels_path = layer_labels_path
 
         path = os.getcwd()
         data_dir = osp.join(path, root, 'raw/*.pkl')
         #voxel size and edge threshold in cm
-        proc_data_dir = f"{description}_vs{self.voxel_size}-et{self.edge_threshold}-aa{int(self.action_to_all)}-disp{int(self.use_displacement)}-c{self.cloth_dim}D"
+        proc_data_dir = (
+            f"{description}_vs{self.voxel_size}-et{self.edge_threshold}"
+            f"-edge{self.edge_mode}-aa{int(self.action_to_all)}"
+            f"-disp{int(self.use_displacement)}-c{self.cloth_dim}D"
+        )
         root = osp.join(root, proc_data_dir)
         # print(root)
 
-        self.filenames_raw = glob.glob(data_dir)
+        all_filenames = sorted(glob.glob(data_dir))
+        if sample_ids is None:
+            self.filenames_raw = all_filenames
+        else:
+            requested = {str(sample_id) for sample_id in sample_ids}
+            self.filenames_raw = [
+                path for path in all_filenames
+                if Path(path).name in requested or Path(path).stem in requested
+            ]
+            if not self.filenames_raw:
+                raise ValueError(
+                    'manifest sample_ids did not match any raw PKLs in %s'
+                    % osp.dirname(data_dir)
+                )
         # self.filenames_raw = self.filenames_raw[0:3]
         # print(self.filenames_raw)
         self.file_count = len(self.filenames_raw)
-        self.num_processes =  multiprocessing.cpu_count()-1
+        if process_workers is None:
+            self.num_processes = max(
+                1, min(4, multiprocessing.cpu_count() - 1)
+            )
+        else:
+            self.num_processes = max(1, int(process_workers))
         self.reps = math.ceil(self.file_count/self.num_processes)
 
         if self.file_count%self.num_processes != 0:
@@ -106,20 +159,18 @@ class BMDataset(Dataset):
         """
         Allows us to construct a graph and pass it to a Data object (which models a single graph) for each data file
         """
-        # self.filenames = self.filenames[0:self.num_processes]
-        files_array = np.reshape(self.filenames, (self.reps, self.num_processes))
-        result_objs = []
-
         print(self.processed_dir)
 
-        for rep, files in enumerate(tqdm(files_array)):
-            # print(f"Rep: {rep+1}, Total Processed: {rep*self.num_processes}")
-            with multiprocessing.Pool(processes=self.num_processes) as pool:
-                for i,f in enumerate(files):
-                    result = pool.apply_async(self.build_graph, args = [f, i+(rep*127)])
-                    result_objs.append(result)
-
-                results = [result.get() for result in result_objs]
+        # Create one worker pool for the entire split. Creating a new pool for
+        # every small batch adds substantial process-start overhead, while the
+        # old result list also grew across batches.
+        with multiprocessing.Pool(processes=self.num_processes) as pool:
+            result_objs = [
+                pool.apply_async(self.build_graph, args=[f, idx])
+                for idx, f in enumerate(self.filenames_raw)
+            ]
+            for result in tqdm(result_objs, total=self.file_count, desc="Building graphs"):
+                result.get()
 
         print("Processing Complete!")
 
@@ -150,7 +201,41 @@ class BMDataset(Dataset):
             action = raw_data['action'] #raw_data['uncover_action']
             initial_blanket_state = raw_data['info']['cloth_initial'][1]
 
-        human_pose = raw_data['observation'][0]
+        observation = raw_data['observation']
+
+        # Recover PKLs exist in two formats:
+        #   1. a numeric flat pose, e.g. shape (28,);
+        #   2. the legacy environment observation list, where observation[0]
+        #      is the pose and the remaining entries are cloth/body metadata.
+        #
+        # Do not use only ``np.asarray(observation).ndim == 1`` to distinguish
+        # them.  A legacy observation is ragged, so NumPy represents the whole
+        # list as a one-dimensional object array; converting that object array
+        # to float then fails with "setting an array element with a sequence".
+        pose_candidates = []
+        if isinstance(observation, (list, tuple)) and len(observation) > 0:
+            first = observation[0]
+            try:
+                first_array = np.asarray(first)
+            except (TypeError, ValueError):
+                first_array = None
+            if first_array is not None and first_array.ndim >= 1 and first_array.size > 1:
+                pose_candidates.append(first)
+            pose_candidates.append(observation)
+        else:
+            pose_candidates.append(observation)
+
+        human_pose = None
+        for candidate in pose_candidates:
+            try:
+                candidate_array = np.asarray(candidate, dtype=np.float32)
+            except (TypeError, ValueError):
+                continue
+            if candidate_array.ndim >= 1 and candidate_array.size > 0:
+                human_pose = candidate_array.reshape(-1)
+                break
+        if human_pose is None:
+            raise ValueError(f"Could not parse human pose from observation in {f}")
 
 
         # initial_num_cloth_points = raw_data['info']['cloth_initial'][0]
@@ -208,8 +293,11 @@ class BMDataset(Dataset):
         convert list of lists to tensor
         """
         #! USE SCALE ACTION FUNCtion INSTEAD
-        scale = [0.44, 1.05]*2
-        action_scaled = action*scale
+        scale = np.asarray([0.44, 1.05] * 2, dtype=np.float32)
+        action = np.asarray(action, dtype=np.float32).reshape(-1)
+        if action.size != 4:
+            raise ValueError(f"Expected 4D action, got shape={action.shape}")
+        action_scaled = action * scale
 
 
         if self.action_to_all:
@@ -246,18 +334,29 @@ class BMDataset(Dataset):
         returns an array of edge indexes, returned as a list of index tuples
         Data requires indexes to be in COO format so will need to convert via performing transpose (.t()) and calling contiguous (.contiguous())
         """
-        cloth_initial = np.array(cloth_initial)
-        if cloth_dim == 2:
-            cloth_initial = np.delete(cloth_initial, 2, axis = 1)
-        threshold = self.edge_threshold
-        edge_inds = []
-        for p1_ind, point_1 in enumerate(cloth_initial):
-            for p2_ind, point_2 in enumerate(cloth_initial): # want duplicate edges to capture both directions of info sharing
-                if p1_ind != p2_ind and np.linalg.norm(point_1 - point_2) <= threshold: # don't consider distance between a point and itself, see if distance is within
-                    edge_inds.append([p1_ind, p2_ind])
-                np.linalg.norm(point_1 - point_2) <= threshold
-        # return torch.tensor([0,2], dtype = torch.long)
-        return torch.tensor(edge_inds, dtype = torch.long)
+        if self.edge_mode == 'mesh':
+            from cloth_mesh_edges import load_cloth_mesh_edge_indices
+
+            return load_cloth_mesh_edge_indices(num_vertices=len(cloth_initial))
+
+        cloth_initial = np.asarray(cloth_initial, dtype=np.float64)
+        if cloth_dim == 2 and cloth_initial.shape[1] >= 3:
+            cloth_initial = np.delete(cloth_initial, 2, axis=1)
+
+        # The previous implementation scanned every point pair in Python.
+        # Radius queries preserve the same directed-edge semantics (the
+        # reverse edge is returned separately) without the O(N^2) scan.
+        neighbor_lists = cKDTree(cloth_initial).query_ball_point(
+            cloth_initial,
+            r=float(self.edge_threshold),
+        )
+        edge_inds = [
+            [point_idx, neighbor_idx]
+            for point_idx, neighbors in enumerate(neighbor_lists)
+            for neighbor_idx in neighbors
+            if neighbor_idx != point_idx
+        ]
+        return torch.tensor(edge_inds, dtype=torch.long)
 
     def get_cloth_as_tensor(self, cloth_initial_3D_pos, cloth_final_3D_pos, cloth_dim):
         if cloth_dim == 2:
@@ -365,9 +464,8 @@ class BMDataset(Dataset):
 
     # ! USE FUNCTION IN BU_GNN_UTIL INSTEAD
     def sub_sample_point_clouds(self, cloth_initial_3D_pos, cloth_final_3D_pos):
-
-        cloth_initial = np.array(cloth_initial_3D_pos)
-        cloth_final = np.array(cloth_final_3D_pos)
+        cloth_initial = np.asarray(cloth_initial_3D_pos, dtype=np.float64)
+        cloth_final = np.asarray(cloth_final_3D_pos, dtype=np.float64)
 
         if self.filter_draping:
             top_of_bed_points = []
@@ -377,28 +475,11 @@ class BMDataset(Dataset):
             cloth_initial = cloth_initial[top_of_bed_points]
             cloth_final = cloth_final[top_of_bed_points]
 
-
-        voxel_size = self.voxel_size
-        nb_vox=np.ceil((np.max(cloth_initial, axis=0) - np.min(cloth_initial, axis=0))/voxel_size)
-        non_empty_voxel_keys, inverse, nb_pts_per_voxel = np.unique(((cloth_initial - np.min(cloth_initial, axis=0)) // voxel_size).astype(int), axis=0, return_inverse=True, return_counts=True)
-        idx_pts_vox_sorted=np.argsort(inverse)
-
-        voxel_grid={}
-        voxel_grid_cloth_inds={}
-        cloth_initial_subsample=[]
-        cloth_final_subsample = []
-        last_seen=0
-        for idx,vox in enumerate(non_empty_voxel_keys):
-            voxel_grid[tuple(vox)]= cloth_initial[idx_pts_vox_sorted[last_seen:last_seen+nb_pts_per_voxel[idx]]]
-            voxel_grid_cloth_inds[tuple(vox)] = idx_pts_vox_sorted[last_seen:last_seen+nb_pts_per_voxel[idx]]
-
-            closest_point_to_barycenter = np.linalg.norm(voxel_grid[tuple(vox)] - np.mean(voxel_grid[tuple(vox)],axis=0),axis=1).argmin()
-            cloth_initial_subsample.append(voxel_grid[tuple(vox)][closest_point_to_barycenter])
-            cloth_final_subsample.append(cloth_final[voxel_grid_cloth_inds[tuple(vox)][closest_point_to_barycenter]])
-
-            last_seen+=nb_pts_per_voxel[idx]
-
-        return cloth_initial_subsample, cloth_final_subsample
+        return voxelize_xyz_state_pair(
+            cloth_initial,
+            cloth_final,
+            self.voxel_size,
+        )
 
     def len(self):
         return len(self.processed_file_names)

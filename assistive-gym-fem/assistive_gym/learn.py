@@ -19,7 +19,7 @@ def setup_config(env, algo, coop=False, seed=0, extra_configs={}, num_processes=
         num_processes = 100 if num_processes > 100 else num_processes # reduce batch size to prevent memory issues
     if algo == 'ppo':
         config = ppo.DEFAULT_CONFIG.copy()
-        config['train_batch_size'] = num_processes
+        config['train_batch_size'] = max(num_processes, 2)
         config['rollout_fragment_length'] = 1
         config['num_sgd_iter'] = 50
         config['sgd_minibatch_size'] = 2
@@ -100,22 +100,24 @@ def load_policy(env, algo, env_name, policy_path=None, coop=False, seed=0, extra
             return agent, None
     return agent, None
 
-def make_env(env_name, coop=False, seed=1001):
+def make_env(env_name, coop=False, seed=1001, env_config=None):
+    env_config = dict(env_config or {})
     if not coop:
-        env = gym.make('assistive_gym:'+env_name)
+        env = gym.make('assistive_gym:'+env_name, **env_config)
     else:
         module = importlib.import_module('assistive_gym.envs')
         env_class = getattr(module, env_name.split('-')[0] + 'Env')
-        env = env_class()
+        env = env_class(**env_config)
     env.seed(seed)
     return env
 
-def train(env_name, algo, timesteps_total=1000000, save_dir='./trained_models/', load_policy_path='', coop=False, seed=0, extra_configs={}):
-    ray.init(num_cpus=multiprocessing.cpu_count(), ignore_reinit_error=True, log_to_driver=False)
-    env = make_env(env_name, coop)
-    agent, checkpoint_path = load_policy(env, algo, env_name, load_policy_path, coop, seed, extra_configs)
+def train(env_name, algo, timesteps_total=1000000, save_dir='./trained_models/', load_policy_path='', coop=False, seed=0, extra_configs={}, num_processes=None):
+    ray.init(num_cpus=multiprocessing.cpu_count(), ignore_reinit_error=True, include_dashboard=False, log_to_driver=False)
+    env = make_env(env_name, coop, seed=seed, env_config=extra_configs.get('env_config', {})) if coop else None
+    agent, checkpoint_path = load_policy(env, algo, env_name, load_policy_path, coop, seed, extra_configs, num_processes=num_processes)
 
-    env.disconnect()
+    if env is not None:
+        env.disconnect()
 
     timesteps = 0
     while timesteps < timesteps_total:
@@ -137,9 +139,9 @@ def train(env_name, algo, timesteps_total=1000000, save_dir='./trained_models/',
     return checkpoint_path
 
 def render_policy(env, env_name, algo, policy_path, coop=False, colab=False, seed=0, n_episodes=1, extra_configs={}):
-    ray.init(num_cpus=multiprocessing.cpu_count(), ignore_reinit_error=True, log_to_driver=False)
+    ray.init(num_cpus=multiprocessing.cpu_count(), ignore_reinit_error=True, include_dashboard=False, log_to_driver=False)
     if env is None:
-        env = make_env(env_name, coop, seed=seed)
+        env = make_env(env_name, coop, seed=seed, env_config=extra_configs.get('env_config', {}))
         if colab:
             env.setup_camera(camera_eye=[0.5, -0.75, 1.5], camera_target=[-0.2, 0, 0.75], fov=60, camera_width=1920//4, camera_height=1080//4)
     test_agent, _ = load_policy(env, algo, env_name, policy_path, coop, seed, extra_configs)
@@ -183,7 +185,7 @@ def evaluate_policy(env_name, algo, policy_path, n_episodes=100, coop=False, see
         print('CMA-ES EVALUATION', policy_path)
         model = keras.models.load_model(policy_path)
     else:
-        ray.init(num_cpus=multiprocessing.cpu_count()-28, ignore_reinit_error=True, log_to_driver=False)
+        ray.init(num_cpus=multiprocessing.cpu_count()-28, ignore_reinit_error=True, include_dashboard=False, log_to_driver=False)
 
         agents = []
         for i in range(16):
@@ -260,7 +262,7 @@ def evaluate_policy_real_world(policy_path, target_limb_code, observation, coop=
     env_name = 'BodiesUncoveredGNN-v1'
     env = None
     algo = 'ppo'
-    ray.init(num_cpus=multiprocessing.cpu_count()-28, ignore_reinit_error=True, log_to_driver=False)
+    ray.init(num_cpus=multiprocessing.cpu_count()-28, ignore_reinit_error=True, include_dashboard=False, log_to_driver=False)
 
     policy_path = f'{policy_path}/PPO_TL{target_limb_code}'
     test_agent, _ = load_policy(env, algo, env_name, policy_path, coop, seed, extra_configs, num_processes=4)
@@ -306,15 +308,56 @@ if __name__ == '__main__':
                         help='Whether rendering should generate an animated png rather than open a window (e.g. when using Google Colab)')
     parser.add_argument('--verbose', action='store_true', default=False,
                         help='Whether to output more verbose prints')
+    parser.add_argument('--recover-raw-dir', default='',
+                        help='Raw recover dataset directory used by RobeRecoverRL-v1.')
+    parser.add_argument('--target-limb-code', type=int, default=None,
+                        help='Fixed target limb for per-limb recover PPO training.')
+    parser.add_argument('--post-release-steps', type=int, default=500,
+                        help='Simulation settling steps after release for recover PPO.')
+    parser.add_argument('--min-uncover-f1', type=float, default=0.745,
+                        help='Minimum live-replayed uncover F1 accepted for training states.')
+    parser.add_argument('--recover-data-split', choices=['train', 'validation', 'all'], default='train',
+                        help='Seed-disjoint recover source split to use for reset sampling.')
+    parser.add_argument('--recover-train-seed-count', type=int, default=80,
+                        help='Number of source seeds per limb assigned to the train split.')
+    parser.add_argument('--recover-split-seed', type=int, default=0,
+                        help='Deterministic seed used to construct train/validation source splits.')
+    parser.add_argument('--max-reset-attempts', type=int, default=50,
+                        help='Maximum samples tried before failing a filtered recover reset.')
+    parser.add_argument('--num-processes', type=int, default=None,
+                        help='Number of RLlib rollout workers; use a small number for PyBullet cloth simulation.')
     args = parser.parse_args()
 
     coop = ('Human' in args.env)
     checkpoint_path = None
+    extra_configs = {}
+    if args.env == 'RobeRecoverRL-v1':
+        if not args.recover_raw_dir:
+            parser.error('--recover-raw-dir is required for RobeRecoverRL-v1.')
+        if args.target_limb_code is None:
+            parser.error('--target-limb-code is required for RobeRecoverRL-v1.')
+        extra_configs['env_config'] = {
+            'recover_raw_dir': args.recover_raw_dir,
+            'target_limb_code': args.target_limb_code,
+            'post_release_steps': args.post_release_steps,
+            'min_uncover_f1': args.min_uncover_f1,
+            'data_split': args.recover_data_split,
+            'train_seed_count': args.recover_train_seed_count,
+            'split_seed': args.recover_split_seed,
+            'max_reset_attempts': args.max_reset_attempts,
+            'sample_seed': args.seed,
+        }
+        print(
+            'Recover PPO config: TL%d, split=%s, post_release_steps=%d, min_uncover_f1=%.3f'
+            % (args.target_limb_code, args.recover_data_split, args.post_release_steps, args.min_uncover_f1)
+        )
+        if args.save_dir == './trained_models/':
+            args.save_dir = './trained_models/FINAL_MODELS/PPO_Recover_TL%d' % args.target_limb_code
+            print('Recover PPO checkpoints: %s' % args.save_dir)
 
     if args.train:
-        checkpoint_path = train(args.env, args.algo, timesteps_total=args.train_timesteps, save_dir=args.save_dir, load_policy_path=args.load_policy_path, coop=coop, seed=args.seed)
+        checkpoint_path = train(args.env, args.algo, timesteps_total=args.train_timesteps, save_dir=args.save_dir, load_policy_path=args.load_policy_path, coop=coop, seed=args.seed, extra_configs=extra_configs, num_processes=args.num_processes)
     if args.render:
-        render_policy(None, args.env, args.algo, checkpoint_path if checkpoint_path is not None else args.load_policy_path, coop=coop, colab=args.colab, seed=args.seed, n_episodes=args.render_episodes)
+        render_policy(None, args.env, args.algo, checkpoint_path if checkpoint_path is not None else args.load_policy_path, coop=coop, colab=args.colab, seed=args.seed, n_episodes=args.render_episodes, extra_configs=extra_configs)
     if args.evaluate:
-        evaluate_policy(args.env, args.algo, checkpoint_path if checkpoint_path is not None else args.load_policy_path, n_episodes=args.eval_episodes, coop=coop, seed=args.seed, verbose=args.verbose)
-
+        evaluate_policy(args.env, args.algo, checkpoint_path if checkpoint_path is not None else args.load_policy_path, n_episodes=args.eval_episodes, coop=coop, seed=args.seed, verbose=args.verbose, extra_configs=extra_configs)

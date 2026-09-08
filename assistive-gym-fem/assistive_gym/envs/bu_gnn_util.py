@@ -13,9 +13,17 @@ import math
 
 # %%
 
-DEFAULT_body_info = \
-    pickle.load(open(os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                'body_info.pkl'), 'rb'))
+_default_body_info_path = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)),
+    "body_info.pkl",
+)
+if os.path.exists(_default_body_info_path):
+    with open(_default_body_info_path, "rb") as _handle:
+        DEFAULT_body_info = pickle.load(_handle)
+else:
+    # Real-world callers pass the measured body_info explicitly.  Do not make
+    # importing this utility depend on the legacy simulation-only pickle.
+    DEFAULT_body_info = None
 
 limb_config = {
     'hand': [2],
@@ -25,6 +33,7 @@ limb_config = {
     'shin': [7, 5],
     'thigh': [7, 5],
     'upperchest': [4],
+    'waist': [4],
     'head': [3],
     }
 
@@ -186,6 +195,18 @@ def get_rectangular_limb_points(
 # https://stackoverflow.com/questions/33510979/generator-of-evenly-spaced-points-in-a-circle-in-python
 
 def get_circular_limb_points(point, radius=None, num_rings=None):
+    """Filled XY disk — the 2D GNN's 'sphere'.
+
+    Ring 0 is the center. ``num_rings`` must be >= 2 or the disk collapses to
+    a single point (the real-world torso bug: 1 sphere + 1 point).
+    """
+
+    radius = float(radius)
+    num_rings = int(num_rings)
+    if not np.isfinite(radius) or radius <= 1e-6:
+        raise ValueError(f"sphere radius must be positive, got {radius}")
+    if num_rings < 2:
+        num_rings = 4
     r = np.linspace(0, radius, num_rings)
     n = [1 + x * 5 for x in range(num_rings)]
     circles = []
@@ -193,10 +214,22 @@ def get_circular_limb_points(point, radius=None, num_rings=None):
         t = np.linspace(0, 2 * np.pi, n, endpoint=False)
         x = r * np.cos(t)
         y = r * np.sin(t)
-        circle = np.c_[x, y] + point
+        circle = np.c_[x, y] + np.asarray(point, dtype=np.float64).reshape(1, -1)[:, :2]
         circles.append(circle)
     circles = np.concatenate(circles)
     return circles
+
+
+def _torso_sphere_radius(radius: float) -> float:
+    """Keep a full disk. The 5 mm overlap offset must not collapse a sphere to a point."""
+
+    radius = float(radius)
+    offset = 0.005
+    if not np.isfinite(radius) or radius <= 1e-6:
+        return 0.0
+    if radius > 2.0 * offset:
+        return radius - offset
+    return radius
 
 
 def get_torso_points(
@@ -205,20 +238,34 @@ def get_torso_points(
     radius_waist,
     num_rings,
     ):
+    """Two full spheres (chest + waist), matching sim's 2D GNN torso."""
+
     shoulder_midpoint = (human_pose[2] + human_pose[8]) / 2
     hip_midpoint = (human_pose[5] + human_pose[11]) / 2
-
-   # print(radius_upperchest, radius_waist)
 
     calc_chest = (human_pose[12] + shoulder_midpoint) / 2
     calc_waist = (human_pose[12] + hip_midpoint) / 2
 
-    offset = .005  # subtract this offest to prevent overlap of torso points with hip and shoulder points
-    chest_points = get_circular_limb_points(calc_chest,
-            radius=radius_upperchest - offset, num_rings=num_rings)
-    waist_points = get_circular_limb_points(calc_waist,
-            radius=radius_waist - offset, num_rings=num_rings)
+    r_chest = _torso_sphere_radius(radius_upperchest)
+    r_waist = _torso_sphere_radius(radius_waist)
+    # If one measurement is missing, copy the other so the graph stays two disks.
+    if r_waist <= 1e-6 < r_chest:
+        r_waist = r_chest
+    if r_chest <= 1e-6 < r_waist:
+        r_chest = r_waist
+    if r_chest <= 1e-6 or r_waist <= 1e-6:
+        raise ValueError(
+            "Upper body needs two full sphere radii (upperchest and waist); "
+            f"got chest={radius_upperchest}, waist={radius_waist}"
+        )
 
+    rings = max(int(num_rings), int(limb_config.get("waist", [4])[0]), 4)
+    chest_points = get_circular_limb_points(
+        calc_chest, radius=r_chest, num_rings=rings
+    )
+    waist_points = get_circular_limb_points(
+        calc_waist, radius=r_waist, num_rings=rings
+    )
     return np.concatenate((chest_points, waist_points))
 
 
@@ -231,6 +278,10 @@ def get_body_points_from_obs(human_pose, target_limb_code,
    # for i in range(len(human_pose)):
    #     human_pose[i, 1] += 0.15
 
+    if body_info is None and DEFAULT_body_info is None:
+        raise FileNotFoundError(
+            "body_info is required; pass the real-world body_info.pkl explicitly"
+        )
     if body_info is None:
         body_info = DEFAULT_body_info
 

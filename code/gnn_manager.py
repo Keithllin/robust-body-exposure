@@ -3,6 +3,7 @@
 import configparser
 import glob
 import os.path as osp
+import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,7 +66,16 @@ class GNN_Manager():
             'voxel_size':initial_dataset.voxel_size,
             'subsample':initial_dataset.subsample,
             'edge_threshold':initial_dataset.edge_threshold,
+            'edge_mode':getattr(initial_dataset, 'edge_mode', ''),
             'action_to_all':initial_dataset.action_to_all,
+            'action_mode':getattr(initial_dataset, 'action_mode', 'broadcast'),
+            'use_oracle_anchor':getattr(initial_dataset, 'use_oracle_anchor', False),
+            'singulate_layers':getattr(initial_dataset, 'singulate_layers', True),
+            'cloth_dim':getattr(initial_dataset, 'cloth_dim', ''),
+            'use_3D':getattr(initial_dataset, 'use_3D', ''),
+            'rot_draping':getattr(initial_dataset, 'rot_draping', ''),
+            'filter_draping':getattr(initial_dataset, 'filter_draping', ''),
+            'process_workers':getattr(initial_dataset, 'num_processes', ''),
             'shuffle':False}
         config['Model'] = {
             'seed':seed,
@@ -108,10 +118,26 @@ class GNN_Manager():
 
 
     def set_dataloaders(self):
-        self.trainDataLoader = torch_geometric.loader.DataLoader(self.TRAIN_DATASET, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers,
-                                                        pin_memory=True, drop_last=False)
-        self.testDataLoader = torch_geometric.loader.DataLoader(self.TEST_DATASET, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers,
-                                                        pin_memory=True, drop_last=False)
+        # sample_id/raw_path are metadata strings and must not enter PyG collate.
+        exclude_keys = ['sample_id', 'raw_path']
+        self.trainDataLoader = torch_geometric.loader.DataLoader(
+            self.TRAIN_DATASET,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=False,
+            exclude_keys=exclude_keys,
+        )
+        self.testDataLoader = torch_geometric.loader.DataLoader(
+            self.TEST_DATASET,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=False,
+            exclude_keys=exclude_keys,
+        )
         # self.imageDataLoader = torch_geometric.loader.DataLoader(self.TEST_DATASET[0:num_images], batch_size=1, shuffle=False, num_workers=1,
         #                                                 pin_memory=True, drop_last=False)
 
@@ -137,6 +163,11 @@ class GNN_Manager():
         model_config = config['Model']
         self.set_args(model_config)
         #! Get rid of the model_config variable?????? just use config['Model']
+        self.dataset_config = dict(config['Dataset']) if 'Dataset' in config else {}
+        self.action_mode = str(self.dataset_config.get('action_mode', 'broadcast')).strip().lower()
+        self.use_oracle_anchor = str(self.dataset_config.get('use_oracle_anchor', 'False')).lower() in {
+            '1', 'true', 'yes', 't',
+        }
 
         self.batch_size = batch_size if batch_size != None else int(model_config['batch_size'])
         self.num_workers = num_workers if num_workers != None else int(model_config['num_workers'])
@@ -150,17 +181,33 @@ class GNN_Manager():
         else:
             self.set_new_save_dir(model_dir)
 
+    def _checkpoint_epoch(self, checkpoint_path):
+        match = re.search(r'^model_(\d+)\.pth$', osp.basename(checkpoint_path))
+        if not match:
+            raise ValueError(f'Unrecognized checkpoint filename: {checkpoint_path}')
+        return int(match.group(1))
+
+    def _numeric_checkpoints(self, checkpoint_dir):
+        # Ignore non-numeric names like model_best_heldout.pth.
+        return [
+            path for path in glob.glob(osp.join(checkpoint_dir, 'model_*.pth'))
+            if re.search(r'^model_(\d+)\.pth$', osp.basename(path))
+        ]
+
     def load_model(self, model_dir, model_checkpoint_number=None):
         checkpoint_dir = osp.join(model_dir, 'checkpoints')
 
         # data_dir = osp.join(path, root, 'raw/*.pkl')
         if model_checkpoint_number==None:
-            all_checkpoints = glob.glob(osp.join(checkpoint_dir, '*.pth'))
-            checkpoint_path = sorted(all_checkpoints)[-1] # pick last checkpoint
-            model_checkpoint_number = len(all_checkpoints)-1
-            # print(model_checkpoint_number)
+            all_checkpoints = self._numeric_checkpoints(checkpoint_dir)
+            if not all_checkpoints:
+                raise FileNotFoundError(f'No numeric checkpoints found in {checkpoint_dir}')
+            checkpoint_path = max(all_checkpoints, key=self._checkpoint_epoch)
+            model_checkpoint_number = self._checkpoint_epoch(checkpoint_path)
+            print(f'Loading checkpoint: {osp.basename(checkpoint_path)} (epoch {model_checkpoint_number})')
         else:
             checkpoint_path = osp.join(checkpoint_dir, f'model_{model_checkpoint_number}.pth')
+            print(f'Loading checkpoint: {osp.basename(checkpoint_path)} (epoch {model_checkpoint_number})')
 
         self.model_checkpoint_number = model_checkpoint_number + 1 #! add code to generate this when you first make the model too
 
@@ -232,7 +279,18 @@ class GNN_Manager():
             'voxel_size':dataset.voxel_size,
             'subsample':dataset.subsample,
             'edge_threshold':dataset.edge_threshold,
+            'edge_mode':getattr(dataset, 'edge_mode', ''),
             'action_to_all':dataset.action_to_all,
+            'action_mode':getattr(dataset, 'action_mode', 'broadcast'),
+            'use_oracle_anchor':getattr(dataset, 'use_oracle_anchor', False),
+            'singulate_layers':getattr(dataset, 'singulate_layers', True),
+            'cloth_dim':getattr(dataset, 'cloth_dim', ''),
+            'use_3D':getattr(dataset, 'use_3D', ''),
+            'rot_draping':getattr(dataset, 'rot_draping', ''),
+            'filter_draping':getattr(dataset, 'filter_draping', ''),
+            'process_workers':getattr(dataset, 'num_processes', ''),
+            'layer_bit_mode':getattr(dataset, 'layer_bit_mode', 'none'),
+            'layer_labels_path':getattr(dataset, 'layer_labels_path', '') or '',
             'shuffle':False}
         config['Model'] = {
             'seed':seed,
@@ -317,8 +375,6 @@ class GNN_Manager():
                     state_loss.backward()
                     self.optimizer.step()
 
-                total_state_loss += state_loss.item()
-
                 if take_images:
                     figure = self.old_generate_eval_figure(data, state_predicted)
                     figure.savefig(osp.join(fig_dir, f'eval_{i}.png'))
@@ -338,9 +394,12 @@ class GNN_Manager():
         return eval_metrics
         # return (eval_metrics, out)
 
-    def train(self, epochs):
+    def train(self, epochs, eval_every_epoch=True, heldout_tag='heldout'):
         self.model.to(self.device)
         best_loss = best_rmse = best_rele = best_time = None
+        best_heldout_loss = None
+        best_heldout_epoch = None
+        has_heldout = len(getattr(self, 'TEST_DATASET', [])) > 0
 
         t_initial = time.time()
         for epoch in tqdm(range(epochs)):
@@ -359,6 +418,31 @@ class GNN_Manager():
             self.writer.add_scalar("Relative_error/train", train_metrics['relative_error'], elapsed_epoch)
             self.writer.add_scalar("Time_per_epoch/train", t1-t0, elapsed_epoch)
 
+            heldout_metrics = None
+            if eval_every_epoch and has_heldout:
+                heldout_metrics = self.run(
+                    self.args,
+                    epoch,
+                    self.testDataLoader,
+                    'eval',
+                    take_images=False)
+                self.writer.add_scalar(f"Loss/{heldout_tag}", heldout_metrics['total_loss'], elapsed_epoch)
+                self.writer.add_scalar(f"RMSE/{heldout_tag}", heldout_metrics['rmse'], elapsed_epoch)
+                self.writer.add_scalar(f"Relative_error/{heldout_tag}", heldout_metrics['relative_error'], elapsed_epoch)
+                if (best_heldout_loss is None) or (heldout_metrics['total_loss'] < best_heldout_loss):
+                    best_heldout_loss = heldout_metrics['total_loss']
+                    best_heldout_epoch = elapsed_epoch
+                    best_heldout_save = {
+                        'model': self.model.state_dict(),
+                        'optimizer': self.optimizer.state_dict(),
+                        'epoch': elapsed_epoch,
+                        'loss': heldout_metrics['total_loss'],
+                        'heldout_rmse': heldout_metrics['rmse'],
+                        'heldout_relative_error': heldout_metrics['relative_error'],
+                    }
+                    best_heldout_path = osp.join(self.checkpoints_dir, f'model_best_{heldout_tag}.pth')
+                    torch.save(best_heldout_save, best_heldout_path)
+
             if (best_loss is None) or (train_metrics['total_loss'] < best_loss):
                 best_loss = train_metrics['total_loss']
                 best_rmse = train_metrics['rmse']
@@ -374,8 +458,14 @@ class GNN_Manager():
                 'epoch': elapsed_epoch,
                 'loss': train_metrics['total_loss']
             }
+            if heldout_metrics is not None:
+                save_dict['heldout_loss'] = heldout_metrics['total_loss']
+                save_dict['heldout_rmse'] = heldout_metrics['rmse']
             savepath = osp.join(self.checkpoints_dir, 'model_{}.pth'.format(elapsed_epoch))
             torch.save(save_dict, savepath)
+
+        if has_heldout and best_heldout_epoch is not None:
+            print(f'Best held-out checkpoint: epoch {best_heldout_epoch}, loss={best_heldout_loss:.6f}')
 
         self.writer.add_hparams(
         {'proc_layers': self.args.proc_layer_num},
@@ -383,7 +473,9 @@ class GNN_Manager():
             'best_loss':best_loss,
             'best_rmse':best_rmse,
             'best_rele':best_rele,
-            'best_time':best_time
+            'best_time':best_time,
+            'best_heldout_loss': best_heldout_loss if best_heldout_loss is not None else -1,
+            'best_heldout_epoch': best_heldout_epoch if best_heldout_epoch is not None else -1,
         },
         run_name='hparams'
         )
@@ -394,7 +486,10 @@ class GNN_Manager():
 
     def evaluate(self, checkpoint_path):
 
-        run_dir = "/home/kpputhuveetil/git/vBM-GNNdev/trained_models/test/runs"
+        run_dir = osp.join(
+            getattr(self, 'checkpoints_dir', osp.dirname(str(checkpoint_path))),
+            'eval_runs',
+        )
         fig_dir = osp.join(run_dir, 'images')
         Path(fig_dir).mkdir(parents=True, exist_ok=True)
         eval_metrics = self.run(

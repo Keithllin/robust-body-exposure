@@ -10,8 +10,16 @@ import pandas as pd
 import torch, torch_geometric
 from torch_geometric.data import Dataset, Data
 from pathlib import Path
-sys.path.insert(0, '/home/kpputhuveetil/git/robe/robust-body-exposure/assistive-gym-fem')
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT / 'assistive-gym-fem'))
 from assistive_gym.envs.bu_gnn_util import *
+from cloth_mesh_edges import load_cloth_mesh_edge_indices
+from oracle_anchor import (
+    anchor_mask,
+    build_node_xyz_action_features,
+    recompute_anchor_idx,
+)
+from binary_grasp_layer import append_broadcast_layer_bit
 
 #%%
 
@@ -19,14 +27,48 @@ from assistive_gym.envs.bu_gnn_util import *
 
 class Runtime_Graph():
     def __init__(self, root, description, voxel_size=float('NaN'), edge_threshold=0.06, action_to_all=True, cloth_initial=None,
-    filter_draping=False, use_3D=False, rot_draping=False):
+    filter_draping=False, use_3D=False, rot_draping=False, edge_mode='radius', use_oracle_anchor=False,
+    singulate_layers=True, oracle_anchor_idx=None, action_mode='broadcast', layer_bit=None,
+    layer_valid=None, is_topmost=None):
         self.voxel_size = voxel_size
         self.filter_draping = filter_draping
         self.subsample = True if not (np.isnan(self.voxel_size)) else False
         self.edge_threshold = edge_threshold
-        self.action_to_all = action_to_all
+        if edge_mode not in ('radius', 'mesh'):
+            raise ValueError("edge_mode must be 'radius' or 'mesh'")
+        if edge_mode == 'mesh' and self.subsample:
+            raise ValueError('edge_mode=mesh requires voxel_size=nan so cloth vertex indices stay aligned with the GT mesh.')
+        self.edge_mode = edge_mode
+        action_mode = str(action_mode).strip().lower()
+        if action_mode not in ('broadcast', 'oracle_triangle'):
+            raise ValueError("action_mode must be 'broadcast' or 'oracle_triangle'")
+        self.action_mode = action_mode
+        if self.action_mode == 'oracle_triangle':
+            use_oracle_anchor = True
+            action_to_all = False
+        self.action_to_all = bool(action_to_all)
+        self.use_oracle_anchor = bool(use_oracle_anchor)
+        self.singulate_layers = bool(singulate_layers)
+        self.oracle_anchor_idx = None if oracle_anchor_idx is None else [int(v) for v in list(oracle_anchor_idx)]
+        # Prefer explicit (layer_valid, is_topmost); fall back to legacy single layer_bit as topmost with valid=1.
+        if layer_valid is not None or is_topmost is not None:
+            self.layer_features = np.asarray(
+                [float(0.0 if layer_valid is None else layer_valid),
+                 float(0.0 if is_topmost is None else is_topmost)],
+                dtype=np.float32,
+            )
+        elif layer_bit is not None:
+            self.layer_features = np.asarray([1.0, float(layer_bit)], dtype=np.float32)
+        else:
+            self.layer_features = None
+        if self.use_oracle_anchor and self.subsample:
+            raise ValueError('use_oracle_anchor requires voxel_size=nan so particle indices stay aligned.')
+        if self.action_mode == 'oracle_triangle' and self.subsample:
+            raise ValueError('action_mode=oracle_triangle requires voxel_size=nan')
         self.cloth_dim = 2 if not use_3D else 3
         self.rot_draping = rot_draping
+        # Keep a 3D copy for optional oracle attachment recomputation.
+        self.cloth_initial_3d = np.asarray(cloth_initial, dtype=np.float64)
         # self.testing = testing
 
         # proc_data_dir = f"{description}_vs{self.voxel_size}-et{self.edge_threshold}-aa{int(self.action_to_all)}"
@@ -44,7 +86,10 @@ class Runtime_Graph():
 
         self.initial_blanket_state = cloth_initial
 
-        self.edge_indices = get_edge_connectivity(self.initial_blanket_state, self.edge_threshold, self.cloth_dim)
+        if self.edge_mode == 'mesh':
+            self.edge_indices = load_cloth_mesh_edge_indices(num_vertices=len(self.initial_blanket_state))
+        else:
+            self.edge_indices = get_edge_connectivity(self.initial_blanket_state, self.edge_threshold, self.cloth_dim)
         if self.cloth_dim == 2:
             self.initial_blanket_state = np.delete(np.array(self.initial_blanket_state), 2, axis = 1)
 
@@ -52,9 +97,13 @@ class Runtime_Graph():
         self.global_vector = torch.zeros(1, 0, dtype=torch.float32)
 
 
-    def build_graph(self, action):
+    def build_graph(self, action, oracle_anchor_idx=None):
 
-        node_features = self.get_node_features(self.initial_blanket_state, action)
+        node_features = self.get_node_features(
+            self.initial_blanket_state,
+            action,
+            oracle_anchor_idx=oracle_anchor_idx,
+        )
 
         data = Data(
             x = node_features,
@@ -71,18 +120,56 @@ class Runtime_Graph():
 
     #!! REPLACE WITH BU GNN FUNCTIONS
 
-    def get_node_features(self, cloth_initial, action):
+    def get_node_features(self, cloth_initial, action, oracle_anchor_idx=None):
         """
         returns an array with shape (# nodes, node feature size)
         convert list of lists to tensor
         """
         #! REPLACE WITH FUNCTION
-        scale = [0.44, 1.05]*2
-        action_scaled = action*scale
+        scale = np.array([0.44, 1.05] * 2, dtype=np.float32)
+        action = np.asarray(action, dtype=np.float32)
+        action_scaled = action * scale
+        if self.layer_features is not None:
+            action_scaled = append_broadcast_layer_bit(action_scaled, self.layer_features)
 
+        anchors = oracle_anchor_idx
+        if anchors is None:
+            anchors = self.oracle_anchor_idx
+        if (self.use_oracle_anchor or self.action_mode == 'oracle_triangle') and anchors is None:
+            anchors = recompute_anchor_idx(
+                action,
+                self.cloth_initial_3d,
+                singulate_layers=self.singulate_layers,
+            )
 
-        if self.action_to_all:
-            nodes = np.append(cloth_initial, [action]*len(cloth_initial), axis=1).tolist()
+        if self.action_mode == 'oracle_triangle':
+            nodes = build_node_xyz_action_features(
+                cloth_initial,
+                action_scaled,
+                action_mode='oracle_triangle',
+                cloth_dim=self.cloth_dim,
+                anchor_idx=anchors,
+            ).tolist()
+        elif self.action_to_all:
+            nodes = build_node_xyz_action_features(
+                cloth_initial,
+                action_scaled,
+                action_mode='broadcast',
+                cloth_dim=self.cloth_dim,
+            ).tolist()
+        else:
+            # Legacy nearest-4 gating (not sim triangle).
+            cloth = np.asarray(cloth_initial, dtype=np.float32)
+            grasp_loc = action_scaled[0:2]
+            dist = np.linalg.norm(cloth[:, 0:2] - grasp_loc[None, :], axis=1)
+            nearest = np.argpartition(dist, min(4, len(dist) - 1))[:4]
+            actions = np.zeros((len(cloth), action_scaled.size), dtype=np.float32)
+            actions[nearest] = action_scaled
+            nodes = np.concatenate([cloth[:, :self.cloth_dim], actions], axis=1).tolist()
+
+        if self.use_oracle_anchor:
+            mask = anchor_mask(len(nodes), anchors)
+            nodes = np.concatenate([np.asarray(nodes, dtype=np.float32), mask], axis=1).tolist()
 
         return torch.tensor(nodes, dtype=torch.float)
 

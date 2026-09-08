@@ -42,7 +42,11 @@ def compute_fscore_recover(initial_covered_status, intermediate_covered_status, 
                 cov_uncov += 1
 
     total = intermediately_covered_num + intermediately_uncovered_num
-    weight = intermediately_uncovered_num / total
+    weight = (
+        intermediately_uncovered_num / total
+        if total > 0
+        else 0.0
+    )
     penalties = []
 
     for i in range(1,cov_uncov+1):  # cov_uncov (increasing weight of the PENALTY)
@@ -52,7 +56,8 @@ def compute_fscore_recover(initial_covered_status, intermediate_covered_status, 
     tp = uncov_cov
     fp = np.sum(penalties)
     fn = uncov_uncov
-    f_score = tp/(tp + 0.5*(fp+fn))
+    denominator = tp + 0.5 * (fp + fn)
+    f_score = 0.0 if denominator <= 0 else tp / denominator
 
     if info:
         return f_score, (tp, cov_uncov, fn)
@@ -84,7 +89,8 @@ def compute_fscore_uncover(initial_covered_status, final_covered_status):
                 nontarg_initially_covered += 1
     # print(total_nontarg)
     total_targ = targ_cov+targ_uncov
-    weight = total_targ/(total_targ+total_nontarg)
+    total = total_targ + total_nontarg
+    weight = total_targ / total if total > 0 else 0.0
     penalties = []
     for i in range(1,nontarg_uncov+1):
         penalty = i*weight
@@ -96,7 +102,8 @@ def compute_fscore_uncover(initial_covered_status, final_covered_status):
     tp = targ_uncov
     fp = np.sum(penalties)
     fn = targ_cov
-    f_score = tp/(tp + 0.5*(fp+fn))
+    denominator = tp + 0.5 * (fp + fn)
+    f_score = 0.0 if denominator <= 0 else tp / denominator
 
     # print(targ_uncov + targ_cov, total_nontarg)
 
@@ -123,6 +130,13 @@ def set_x0_for_cmaes(target_limb_code):
     return x0
 
 
+def assemble_fixed_pick_action(pick_fixed, place_xy):
+    """Assemble 4D policy action from a locked pick and a (possibly CMA) place."""
+    pick = np.asarray(pick_fixed, dtype=np.float64).reshape(-1)[:2]
+    place = np.asarray(place_xy, dtype=np.float64).reshape(-1)[:2]
+    return np.concatenate([pick, place]).astype(np.float64)
+
+
 def save_data_to_pickle(idx, seed, recovering, uncover_action, recover_action, human_pose, target_limb_code, sim_info, cma_info, iter_data_dir):
     #! when lines below are uncommented, will not save if no grasp on cloth found
     # if isinstance(covered_status, int) and covered_status == -1:
@@ -135,7 +149,11 @@ def save_data_to_pickle(idx, seed, recovering, uncover_action, recover_action, h
     Path(raw_dir).mkdir(parents=True, exist_ok=True)
     pkl_loc = raw_dir
 
-    with open(os.path.join(pkl_loc, filename +".pkl"),"wb") as f:
+    final_path = os.path.join(pkl_loc, filename + ".pkl")
+    # Write atomically so a worker killed by the watchdog cannot leave a
+    # partially written file that later gets mistaken for a completed case.
+    temp_path = os.path.join(pkl_loc, f".{filename}.tmp")
+    with open(temp_path, "wb") as f:
         pickle.dump({
             "recovering" : recovering,
             "uncover_action":uncover_action,
@@ -146,6 +164,7 @@ def save_data_to_pickle(idx, seed, recovering, uncover_action, recover_action, h
             'cma_info':cma_info,
             'observation':[sim_info['observation']],
             'info':sim_info['info']}, f)
+    os.replace(temp_path, final_path)
 
 def save_dataset(idx, graph, data, sim_info, action, human_pose, covered_status):
     # ! function behavior is not correct at the moment
@@ -223,68 +242,577 @@ def get_body_point_colors_recovering(initial_covered_status, intermediate_covere
 
     return point_colors
 
-def generate_figure_data_collection(tl, uncover_action, recover_action, body_info, all_body_points, cloth_initial, cloth_intermediate, final_cloth):
-    scale = 4
-    num_subplots = 1
+# High-contrast colors for the realized 3-vertex grasp triangle.
+GT_ANCHOR_COLORS = (
+    'rgba(255, 120, 0, 1)',    # orange
+    'rgba(0, 210, 90, 1)',     # green
+    'rgba(40, 140, 255, 1)',   # blue
+)
 
-    # fig = go.Figure()
+
+def add_gt_anchor_markers(
+    fig,
+    cloth_points,
+    anchor_idx,
+    row=1,
+    col=2,
+    name='GT anchor',
+    marker_color=None,
+    size=18,
+    showlegend=True,
+    per_vertex_colors=True,
+):
+    """Overlay realized grasp triangle vertices on a gen_images-style subplot.
+
+    Default: each of the 3 anchors gets a distinct filled color (not red X).
+    """
+    cloth = np.asarray(cloth_points, dtype=np.float64)
+    if cloth.ndim != 2 or cloth.shape[0] == 0:
+        return fig
+    anchors = []
+    for idx in list(anchor_idx or []):
+        i = int(idx)
+        if 0 <= i < len(cloth):
+            anchors.append(i)
+    if not anchors:
+        return fig
+
+    if per_vertex_colors:
+        for k, ai in enumerate(anchors):
+            color = GT_ANCHOR_COLORS[k % len(GT_ANCHOR_COLORS)]
+            fig.add_trace(
+                go.Scatter(
+                    mode='markers',
+                    x=[float(cloth[ai, 0])],
+                    y=[float(cloth[ai, 1])],
+                    name='%s[%d]' % (name, k) if showlegend else name,
+                    showlegend=bool(showlegend),
+                    marker=dict(
+                        color=color,
+                        size=size,
+                        symbol='circle',
+                        line=dict(width=2, color='rgba(0,0,0,1)'),
+                    ),
+                ),
+                row=row,
+                col=col,
+            )
+        return fig
+
+    color = marker_color or GT_ANCHOR_COLORS[0]
+    pts = cloth[anchors]
+    fig.add_trace(
+        go.Scatter(
+            mode='markers',
+            x=pts[:, 0],
+            y=pts[:, 1],
+            name='%s (n=%d)' % (name, len(anchors)),
+            showlegend=bool(showlegend),
+            marker=dict(
+                color=color,
+                size=size,
+                symbol='circle',
+                line=dict(width=2, color='rgba(0,0,0,1)'),
+            ),
+        ),
+        row=row,
+        col=col,
+    )
+    return fig
+
+
+def add_action_arrow(fig, action_xy4, col=1, color='rgb(220, 40, 40)', width=4, pick_size=14, pick_name=None, showlegend=False):
+    """Add pick marker + place arrow on subplot ``col`` (gen_images axis indexing)."""
+    action = np.asarray(action_xy4, dtype=np.float64).reshape(-1)
+    if action.size < 4:
+        return fig
+    xref = 'x%d' % int(col)
+    yref = 'y%d' % int(col)
+    fig.add_trace(
+        go.Scatter(
+            mode='markers',
+            x=[float(action[0])],
+            y=[float(action[1])],
+            name=pick_name or 'grasp',
+            showlegend=bool(showlegend),
+            marker=dict(color=color, size=pick_size, symbol='diamond',
+                        line=dict(width=1.5, color='rgba(0,0,0,1)')),
+        ),
+        row=1,
+        col=int(col),
+    )
+    annotations = list(fig.layout.annotations) if fig.layout.annotations else []
+    annotations.append(
+        go.layout.Annotation(
+            dict(
+                ax=float(action[0]),
+                ay=float(action[1]),
+                xref=xref,
+                yref=yref,
+                text='',
+                showarrow=True,
+                axref=xref,
+                ayref=yref,
+                x=float(action[2]),
+                y=float(action[3]),
+                arrowhead=3,
+                arrowwidth=width,
+                arrowcolor=color,
+            )
+        )
+    )
+    fig.update_layout(annotations=annotations)
+    return fig
+
+
+def add_corner_annotation(fig, text, x=1.0, y=1.0, xanchor='right', yanchor='top', font_size=14):
+    """Add a gen_images-style corner text box to an existing figure."""
+    if not text:
+        return fig
+    annotation = dict(
+        text=str(text),
+        x=x,
+        y=y,
+        xref='paper',
+        yref='paper',
+        xanchor=xanchor,
+        yanchor=yanchor,
+        showarrow=False,
+        align='right' if xanchor == 'right' else 'left',
+        bgcolor='rgba(255,255,255,0.85)',
+        bordercolor='rgba(0,0,0,0.25)',
+        borderwidth=1,
+        font=dict(size=font_size, color='rgba(0,0,0,1)'),
+    )
+    annotations = list(fig.layout.annotations) if fig.layout.annotations else []
+    annotations.append(annotation)
+    fig.update_layout(annotations=annotations)
+    return fig
+
+
+def write_gen_images_figure(fig, png_path, html_path=None):
+    """Write plotly figure like gen_images.py (PNG preferred, HTML fallback)."""
+    png_path = str(png_path)
+    html_path = str(html_path) if html_path else (os.path.splitext(png_path)[0] + '.html')
+    Path(png_path).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fig.write_image(png_path)
+        return png_path, ''
+    except Exception as exc:
+        fig.write_html(html_path)
+        return html_path, '%s: %s' % (type(exc).__name__, exc)
+
+
+def generate_figure_data_collection_with_anchors(
+    tl,
+    uncover_action,
+    recover_action,
+    body_info,
+    all_body_points,
+    cloth_initial,
+    cloth_intermediate,
+    final_cloth,
+    recover_anchor_idx=None,
+    uncover_anchor_idx=None,
+    metrics=None,
+    annotation_text=None,
+    mark_recover_on_uncover_state=True,
+):
+    """gen_images data-collection figure + recover grasp/anchors on uncover state.
+
+    Recover grasp happens on ``cloth_intermediate`` (post-uncover). We therefore:
+      - draw recover pick/place on the Uncover panel (col=1) where intermediate is shown;
+      - draw the same colored 3-anchor highlights on both Uncover (intermediate) and
+        Recover (intermediate) panels for correspondence;
+      - keep recover action on the Recover panel as well.
+    """
+    fig = generate_figure_data_collection(
+        tl,
+        uncover_action,
+        recover_action,
+        body_info,
+        all_body_points,
+        cloth_initial,
+        cloth_intermediate,
+        final_cloth,
+        metrics=metrics,
+    )
+
+    # Recover grasp/action on uncover (intermediate) state — distinct from black uncover arrow.
+    if mark_recover_on_uncover_state and recover_action is not None:
+        fig = add_action_arrow(
+            fig,
+            recover_action,
+            col=1,
+            color='rgb(220, 40, 40)',
+            width=4,
+            pick_size=15,
+            pick_name='recover grasp (on uncover state)',
+            showlegend=True,
+        )
+
+    if uncover_anchor_idx:
+        fig = add_gt_anchor_markers(
+            fig,
+            cloth_initial,
+            uncover_anchor_idx,
+            row=1,
+            col=1,
+            name='Uncover GT',
+            showlegend=True,
+            per_vertex_colors=True,
+        )
+
+    if recover_anchor_idx:
+        # Same colors on both panels (uncover-state / recover-start = intermediate).
+        fig = add_gt_anchor_markers(
+            fig,
+            cloth_intermediate,
+            recover_anchor_idx,
+            row=1,
+            col=1,
+            name='Recover GT',
+            showlegend=True,
+            per_vertex_colors=True,
+            size=18,
+        )
+        fig = add_gt_anchor_markers(
+            fig,
+            cloth_intermediate,
+            recover_anchor_idx,
+            row=1,
+            col=2,
+            name='Recover GT',
+            showlegend=False,
+            per_vertex_colors=True,
+            size=18,
+        )
+
+    if annotation_text:
+        fig = add_corner_annotation(fig, annotation_text)
+    return fig
+
+
+def generate_figure_data_collection(tl, uncover_action, recover_action, body_info, all_body_points, cloth_initial, cloth_intermediate, final_cloth, metrics=None):
+    scale = 4
+    num_subplots = 2
+
     fig = make_subplots(rows=1, cols=num_subplots)
     arrows = []
     bg_color = 'rgba(255,255,255,1)'
 
     for i in range(num_subplots):
-
-        # fig.add_trace(
-        #     go.Scatter(mode='markers',
-        #                 x = all_body_points[:,0],
-        #                 y = all_body_points[:,1],
-        #                 marker=dict(color = 'rgba(12, 216, 112, 0.8)', size = 10),
-        #                 showlegend=False), row=1, col=i+1)
-
         fig.add_trace(
-            go.Scatter(mode='markers',
-                    x = cloth_initial[:,0],
-                    y = cloth_initial[:,1],
-                    showlegend = False,
-                    marker=dict(color = 'rgba(99, 190, 242, 0.1)', size = 9)), row=1, col=i+1)
+            go.Scatter(
+                mode='markers',
+                x=all_body_points[:,0],
+                y=all_body_points[:,1],
+                marker=dict(color='rgba(12, 216, 112, 0.8)', size=10),
+                showlegend=False,
+            ),
+            row=1,
+            col=i+1,
+        )
 
-        fig.add_trace(
-            go.Scatter(mode='markers',
-                    x = cloth_intermediate[:,0],
-                    y = cloth_intermediate[:,1],
-                    showlegend = False,
-                    marker=dict(color = 'rgba(99, 190, 242, 0.5)', size = 9)), row=1, col=i+1)
+    # Uncover panel: initial -> intermediate
+    fig.add_trace(
+        go.Scatter(
+            mode='markers',
+            x=cloth_initial[:,0],
+            y=cloth_initial[:,1],
+            showlegend=False,
+            marker=dict(color='rgba(99, 190, 242, 0.15)', size=9),
+        ),
+        row=1,
+        col=1,
+    )
 
+    fig.add_trace(
+        go.Scatter(
+            mode='markers',
+            x=cloth_intermediate[:,0],
+            y=cloth_intermediate[:,1],
+            showlegend=False,
+            marker=dict(color='rgba(38, 60, 201, 0.55)', size=9),
+        ),
+        row=1,
+        col=1,
+    )
 
-        fig.add_trace(
-            go.Scatter(mode='markers',
-                    x = final_cloth[:,0],
-                    y = final_cloth[:,1],
-                    showlegend = False,
-                    marker=dict(color = 'rgba(38, 60, 201, 0.5)', size = 9)), row=1, col=i+1)
+    fig.add_trace(
+        go.Scatter(
+            mode='markers',
+            x=[uncover_action[0]],
+            y=[uncover_action[1]],
+            showlegend=False,
+            marker=dict(color='rgba(0,0,0,1)', size=12),
+        ),
+        row=1,
+        col=1,
+    )
+    arrows.append(
+        go.layout.Annotation(
+            dict(
+                ax=uncover_action[0],
+                ay=uncover_action[1],
+                xref='x1',
+                yref='y1',
+                text='',
+                showarrow=True,
+                axref='x1',
+                ayref='y1',
+                x=uncover_action[2],
+                y=uncover_action[3],
+                arrowhead=3,
+                arrowwidth=4,
+                arrowcolor='rgb(0,0,0)',
+            )
+        )
+    )
 
-        action_arrow = go.layout.Annotation(dict(
-                        ax=recover_action[0],
-                        ay=recover_action[1],
-                        xref=f"x{i+1}", yref=f"y{i+1}",
-                        text="",
-                        showarrow=True,
-                        axref=f"x{i+1}", ayref=f"y{i+1}",
-                        x=recover_action[2],
-                        y=recover_action[3],
-                        arrowhead=3,
-                        arrowwidth=4,
-                        arrowcolor='rgb(0,0,0)'))
+    # Recover panel: intermediate -> final
+    fig.add_trace(
+        go.Scatter(
+            mode='markers',
+            x=cloth_intermediate[:,0],
+            y=cloth_intermediate[:,1],
+            showlegend=False,
+            marker=dict(color='rgba(99, 190, 242, 0.35)', size=9),
+        ),
+        row=1,
+        col=2,
+    )
 
-        arrows.append(action_arrow)
+    fig.add_trace(
+        go.Scatter(
+            mode='markers',
+            x=final_cloth[:,0],
+            y=final_cloth[:,1],
+            showlegend=False,
+            marker=dict(color='rgba(38, 60, 201, 0.7)', size=9),
+        ),
+        row=1,
+        col=2,
+    )
 
+    fig.add_trace(
+        go.Scatter(
+            mode='markers',
+            x=[recover_action[0]],
+            y=[recover_action[1]],
+            showlegend=False,
+            marker=dict(color='rgba(0,0,0,1)', size=12),
+        ),
+        row=1,
+        col=2,
+    )
+    arrows.append(
+        go.layout.Annotation(
+            dict(
+                ax=recover_action[0],
+                ay=recover_action[1],
+                xref='x2',
+                yref='y2',
+                text='',
+                showarrow=True,
+                axref='x2',
+                ayref='y2',
+                x=recover_action[2],
+                y=recover_action[3],
+                arrowhead=3,
+                arrowwidth=4,
+                arrowcolor='rgb(0,0,0)',
+            )
+        )
+    )
+
+    annotations = [
+        go.layout.Annotation(
+            dict(
+                x=0.22,
+                y=1.08,
+                xref='paper',
+                yref='paper',
+                text='Uncover',
+                showarrow=False,
+                font=dict(size=18),
+            )
+        ),
+        go.layout.Annotation(
+            dict(
+                x=0.78,
+                y=1.08,
+                xref='paper',
+                yref='paper',
+                text='Recover',
+                showarrow=False,
+                font=dict(size=18),
+            )
+        ),
+    ]
+
+    if metrics:
+        uncover_reward = metrics.get('uncover_reward')
+        uncover_f1 = metrics.get('uncover_f1')
+        recover_reward = metrics.get('recover_reward')
+        recover_f1 = metrics.get('recover_f1')
+        metrics_text = (
+            f"Uncover reward={uncover_reward:.2f}, F1={uncover_f1:.3f}"
+            f"<br>Recover reward={recover_reward:.2f}, F1={recover_f1:.3f}"
+        )
+        annotations.append(
+            go.layout.Annotation(
+                dict(
+                    x=0.5,
+                    y=-0.05,
+                    xref='paper',
+                    yref='paper',
+                    text=metrics_text,
+                    showarrow=False,
+                    font=dict(size=16),
+                )
+            )
+        )
+
+    annotations.extend(arrows)
+
+    for i in range(num_subplots):
         fig.update_xaxes(autorange="reversed", visible=False, row=1, col=i+1)
         fig.update_yaxes(autorange="reversed", visible=False, row=1, col=i+1)
 
-    fig.update_layout(width=140*scale, height=195*scale,plot_bgcolor=bg_color, paper_bgcolor=bg_color,annotations=arrows,
-                        title={'text': f"Target",'y':0.08,'x':0.5,'xanchor': 'center','yanchor': 'bottom'})
+    fig.update_layout(
+        width=140*scale*2,
+        height=195*scale,
+        plot_bgcolor=bg_color,
+        paper_bgcolor=bg_color,
+        annotations=annotations,
+        title={'text': f"Target: {target_names[tl]}", 'y':0.98, 'x':0.5, 'xanchor': 'center', 'yanchor': 'top'},
+    )
 
-    # fig.show()
+    return fig
+
+def generate_figure_uncover_training(tl, uncover_action, body_info, all_body_points, cloth_initial, cloth_final, metrics=None):
+    """Single-panel uncover training visualization (gen_images style)."""
+    scale = 4
+    bg_color = 'rgba(255,255,255,1)'
+
+    fig = make_subplots(rows=1, cols=1)
+    fig.add_trace(
+        go.Scatter(
+            mode='markers',
+            x=all_body_points[:, 0],
+            y=all_body_points[:, 1],
+            marker=dict(color='rgba(12, 216, 112, 0.8)', size=10),
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            mode='markers',
+            x=cloth_initial[:, 0],
+            y=cloth_initial[:, 1],
+            showlegend=False,
+            marker=dict(color='rgba(99, 190, 242, 0.15)', size=9),
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            mode='markers',
+            x=cloth_final[:, 0],
+            y=cloth_final[:, 1],
+            showlegend=False,
+            marker=dict(color='rgba(38, 60, 201, 0.55)', size=9),
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            mode='markers',
+            x=[uncover_action[0]],
+            y=[uncover_action[1]],
+            showlegend=False,
+            marker=dict(color='rgba(0,0,0,1)', size=12),
+        ),
+        row=1,
+        col=1,
+    )
+
+    annotations = [
+        go.layout.Annotation(
+            dict(
+                ax=uncover_action[0],
+                ay=uncover_action[1],
+                xref='x1',
+                yref='y1',
+                text='',
+                showarrow=True,
+                axref='x1',
+                ayref='y1',
+                x=uncover_action[2],
+                y=uncover_action[3],
+                arrowhead=3,
+                arrowwidth=4,
+                arrowcolor='rgb(0,0,0)',
+            )
+        ),
+        go.layout.Annotation(
+            dict(
+                x=0.5,
+                y=1.08,
+                xref='paper',
+                yref='paper',
+                text='Uncover (training GT)',
+                showarrow=False,
+                font=dict(size=18),
+            )
+        ),
+    ]
+
+    title = f"Target: {target_names[tl]}"
+    if metrics:
+        uncover_reward = metrics.get('uncover_reward')
+        uncover_f1 = metrics.get('uncover_f1')
+        lower_steps = metrics.get('lower_step_count')
+        prs = metrics.get('post_release_steps')
+        metrics_bits = []
+        if uncover_reward is not None:
+            metrics_bits.append(f"reward={uncover_reward:.2f}")
+        if uncover_f1 is not None:
+            metrics_bits.append(f"F1={uncover_f1:.3f}")
+        if lower_steps is not None:
+            metrics_bits.append(f"lower_steps={lower_steps}")
+        if prs is not None:
+            metrics_bits.append(f"PRS={prs}")
+        if metrics_bits:
+            annotations.append(
+                go.layout.Annotation(
+                    dict(
+                        x=0.5,
+                        y=-0.08,
+                        xref='paper',
+                        yref='paper',
+                        text=", ".join(metrics_bits),
+                        showarrow=False,
+                        font=dict(size=16),
+                    )
+                )
+            )
+
+    fig.update_xaxes(autorange='reversed', visible=False, row=1, col=1)
+    fig.update_yaxes(autorange='reversed', visible=False, row=1, col=1)
+    fig.update_layout(
+        width=140 * scale,
+        height=195 * scale,
+        plot_bgcolor=bg_color,
+        paper_bgcolor=bg_color,
+        annotations=annotations,
+        title={'text': title, 'y': 0.98, 'x': 0.5, 'xanchor': 'center', 'yanchor': 'top'},
+    )
     return fig
 
 def generate_figure_recover(sim_info_fscore, cma_info_fscore, sim_reward, sim_reward_info, cma_reward, cma_reward_info, tl, uncover_action, recover_action, body_info, all_body_points, cloth_initial, final_cloths, cloth_intermediate, initial_covered_status, covered_statuses, fscores, plot_initial=False, compare_subplots=False, transparent=False, draw_axes=False):
@@ -477,7 +1005,7 @@ def generate_figure_uncover(sim_reward, cma_reward, tl, uncover_action, body_inf
                         xref=f"x{i}", yref=f"y{i}",
                         text="",
                         showarrow=True,
-                        axref=f"x{i+1}", ayref=f"y{i}",
+                        axref=f"x{i}", ayref=f"y{i}",
                         x=uncover_action[2],
                         y=uncover_action[3],
                         arrowhead=3,
@@ -494,6 +1022,225 @@ def generate_figure_uncover(sim_reward, cma_reward, tl, uncover_action, body_inf
     fig.update_layout(width=100*scale*4, height=200*scale,plot_bgcolor=bg_color, paper_bgcolor=bg_color,annotations=annotations,
                         title={'text': f"Target: {target_names[tl]}<br>Sim F-Score = {fscores[0]:.2f}<br>CMA F-Score = {fscores[1]:.2f}",'y':0.08,'x':0.5,'xanchor': 'center','yanchor': 'bottom'})
 
+    return fig
+
+def generate_figure_uncover_open_loop(
+    tl,
+    uncover_action,
+    all_body_points,
+    cloth_initial,
+    gt_cloth,
+    pred_cloth,
+    initial_covered_status,
+    gt_covered_status,
+    pred_covered_status,
+    fscores,
+    metrics=None,
+    include_overlay=True,
+    transparent=False,
+):
+    """Open-loop validation figure: GT vs model-predicted uncover cloth."""
+    point_colors_gt = get_body_point_colors_uncovering(initial_covered_status, gt_covered_status)
+    point_colors_pred = get_body_point_colors_uncovering(initial_covered_status, pred_covered_status)
+
+    scale = 4
+    num_cols = 5 if include_overlay else 4
+    bg_color = 'rgba(0,0,0,0)' if transparent else 'rgba(255,255,255,1)'
+
+    fig = make_subplots(rows=1, cols=num_cols)
+    annotations = []
+
+    for col in range(1, num_cols + 1):
+        fig.add_trace(
+            go.Scatter(
+                mode='markers',
+                x=cloth_initial[:, 0],
+                y=cloth_initial[:, 1],
+                showlegend=False,
+                marker=dict(color='rgba(99, 190, 242, 0.1)', size=9),
+            ),
+            row=1,
+            col=col,
+        )
+
+    fig.add_trace(
+        go.Scatter(
+            mode='markers',
+            x=all_body_points[:, 0],
+            y=all_body_points[:, 1],
+            marker=dict(color='rgba(255, 186, 71, 1)', size=10),
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
+
+    for col, colors in ((2, point_colors_gt), (3, point_colors_pred)):
+        fig.add_trace(
+            go.Scatter(
+                mode='markers',
+                x=all_body_points[:, 0],
+                y=all_body_points[:, 1],
+                marker=dict(color=colors, size=10),
+                showlegend=False,
+            ),
+            row=1,
+            col=col,
+        )
+
+    fig.add_trace(
+        go.Scatter(
+            mode='markers',
+            x=gt_cloth[:, 0],
+            y=gt_cloth[:, 1],
+            showlegend=False,
+            marker=dict(color='rgba(38, 60, 201, 0.55)', size=9),
+        ),
+        row=1,
+        col=2,
+    )
+    fig.add_trace(
+        go.Scatter(
+            mode='markers',
+            x=pred_cloth[:, 0],
+            y=pred_cloth[:, 1],
+            showlegend=False,
+            marker=dict(color='rgba(38, 60, 201, 0.55)', size=9),
+        ),
+        row=1,
+        col=3,
+    )
+
+    if include_overlay:
+        fig.add_trace(
+            go.Scatter(
+                mode='markers',
+                x=gt_cloth[:, 0],
+                y=gt_cloth[:, 1],
+                showlegend=False,
+                marker=dict(color='rgba(99, 190, 242, 0.35)', size=8),
+            ),
+            row=1,
+            col=4,
+        )
+        fig.add_trace(
+            go.Scatter(
+                mode='markers',
+                x=pred_cloth[:, 0],
+                y=pred_cloth[:, 1],
+                showlegend=False,
+                marker=dict(color='rgba(220, 53, 69, 0.45)', size=8),
+            ),
+            row=1,
+            col=4,
+        )
+        annotations.append(
+            go.layout.Annotation(
+                dict(
+                    x=0.72,
+                    y=1.08,
+                    xref='paper',
+                    yref='paper',
+                    text='Overlay (GT blue / Pred red)',
+                    showarrow=False,
+                    font=dict(size=14),
+                )
+            )
+        )
+
+    for col in (2, 3):
+        fig.add_trace(
+            go.Scatter(
+                mode='markers',
+                x=[uncover_action[0]],
+                y=[uncover_action[1]],
+                showlegend=False,
+                marker=dict(color='rgba(0,0,0,1)', size=12),
+            ),
+            row=1,
+            col=col,
+        )
+        annotations.append(
+            go.layout.Annotation(
+                dict(
+                    ax=uncover_action[0],
+                    ay=uncover_action[1],
+                    xref=f'x{col}',
+                    yref=f'y{col}',
+                    text='',
+                    showarrow=True,
+                    axref=f'x{col}',
+                    ayref=f'y{col}',
+                    x=uncover_action[2],
+                    y=uncover_action[3],
+                    arrowhead=3,
+                    arrowwidth=4,
+                    arrowcolor='rgb(0,0,0)',
+                )
+            )
+        )
+
+    col_labels = ['Initial', 'GT', 'Pred']
+    if include_overlay:
+        col_labels.append('Overlay')
+    for idx, label in enumerate(col_labels):
+        annotations.append(
+            go.layout.Annotation(
+                dict(
+                    x=(idx + 0.5) / num_cols,
+                    y=1.08,
+                    xref='paper',
+                    yref='paper',
+                    text=label,
+                    showarrow=False,
+                    font=dict(size=16),
+                )
+            )
+        )
+
+    if metrics:
+        metrics_text = (
+            f"RMSE={metrics.get('vertex_rmse', float('nan')):.4f}, "
+            f"GT F1={metrics.get('gt_f1', float('nan')):.3f}, "
+            f"Pred F1={metrics.get('pred_f1', float('nan')):.3f}, "
+            f"reward gap={metrics.get('reward_gap', float('nan')):.2f}"
+        )
+        annotations.append(
+            go.layout.Annotation(
+                dict(
+                    x=0.5,
+                    y=-0.08,
+                    xref='paper',
+                    yref='paper',
+                    text=metrics_text,
+                    showarrow=False,
+                    font=dict(size=14),
+                )
+            )
+        )
+
+    for col in range(1, num_cols + 1):
+        fig.update_xaxes(autorange='reversed', visible=False, row=1, col=col)
+        fig.update_yaxes(autorange='reversed', visible=False, row=1, col=col)
+
+    fig.update_layout(
+        width=100 * scale * num_cols,
+        height=200 * scale,
+        plot_bgcolor=bg_color,
+        paper_bgcolor=bg_color,
+        annotations=annotations,
+        title={
+            'text': (
+                f"Target: {target_names[tl]}<br>"
+                f"GT F-Score = {fscores[0]:.2f}<br>"
+                f"Pred F-Score = {fscores[1]:.2f}"
+            ),
+            'y': 0.08,
+            'x': 0.5,
+            'xanchor': 'center',
+            'yanchor': 'bottom',
+        },
+    )
     return fig
 
 def generate_comparison(tl, action, body_info, all_body_points, cloth_initial, cloth_intermediate, cloth_final, pred, initial_covered_status, covered_statuses, fscores, plot_initial=False, transparent=False, draw_axes =False):
@@ -847,4 +1594,3 @@ def generate_figure_recovering(action, all_body_points, cloth_initial, cloth_int
 
 #     # fig.show()
 #     return fig
-

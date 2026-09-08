@@ -1,5 +1,6 @@
 #%%
 import argparse
+import json
 import math
 import os.path as osp
 import pickle
@@ -18,7 +19,7 @@ from assistive_gym.envs.bu_gnn_util import *  # noqa: F401,F403
 from cma_gnn_util import *  # noqa: F401,F403
 
 
-MODEL_DIR = Path('/mnt/data/MudkipUsersSu2025/kpputhuveetil/git/robe/robust-body-exposure_unstable/trained_models/FINAL_MODELS')
+MODEL_DIR = REPO_ROOT / 'trained_models/FINAL_MODELS'
 TARGET_LIMBS = [2, 4, 5, 8, 10, 11, 12, 13, 14, 15]
 
 
@@ -107,6 +108,48 @@ def safe_median(values):
     return float(np.median(values))
 
 
+def filter_filenames_by_eval_set(filenames, eval_set_path):
+    """Restrict a raw directory to source files listed in a manifest."""
+
+    if not eval_set_path:
+        return filenames
+    manifest_path = Path(eval_set_path).expanduser().resolve()
+    with manifest_path.open('r', encoding='utf-8') as handle:
+        payload = json.load(handle)
+    records = payload.get('records', []) if isinstance(payload, dict) else payload
+    if not isinstance(records, list) or not records:
+        raise ValueError(f'eval-set has no records: {manifest_path}')
+
+    by_path = {path.resolve(): path for path in filenames}
+    selected = []
+    missing = []
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise ValueError(f'eval-set record {index} is not an object')
+        source = (
+            record.get('source_uncover_pkl')
+            or record.get('source_pkl')
+            or record.get('pkl')
+        )
+        if not source:
+            raise ValueError(f'eval-set record {index} has no source pickle')
+        source_path = Path(source).expanduser().resolve()
+        path = by_path.get(source_path)
+        if path is None:
+            missing.append(str(source_path))
+        else:
+            selected.append(path)
+    if missing:
+        preview = ', '.join(missing[:3])
+        raise FileNotFoundError(
+            f'{len(missing)} eval-set files are not in raw dir '
+            f'{filenames[0].parent}: {preview}'
+        )
+    if len({path.resolve() for path in selected}) != len(selected):
+        raise ValueError(f'eval-set contains duplicate source files: {manifest_path}')
+    return sorted(selected)
+
+
 def format_failed(count, total):
     if total <= 0:
         return '0/0 (0.0%)'
@@ -120,10 +163,22 @@ def emit(lines, text=''):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--arg_model', type=str, default='/mnt/data/MudkipUsersSu2025/kpputhuveetil/git/robe/robust-body-exposure_unstable/trained_models/FINAL_MODELS/Recover/TL_2, 4, 5, 8, 10, 11, 12, 13, 14, 15_Recover_Data_100_seeds_30000_states_30000_epochs=250_batch=50_workers=4_1705986655')
+    parser.add_argument(
+        '--arg_model',
+        type=str,
+        required=True,
+        help='Model directory or path relative to trained_models/FINAL_MODELS.',
+    )
     parser.add_argument('--eval-dir-name', type=str, default='joint_evaluations')
-    parser.add_argument('--eval-condition', type=str, default='')
+    parser.add_argument(
+        '--eval-condition',
+        type=str,
+        default='',
+        help='Optional evaluation subdirectory; use --raw-dir for an explicit raw path.',
+    )
     parser.add_argument('--raw-dir', type=str, default='')
+    parser.add_argument('--eval-set', type=str, default='',
+                        help='Optional manifest; analyze only its listed source pickles.')
     parser.add_argument('--reward-key', type=str, default='auto', choices=['auto', 'joint', 'recover', 'uncover'])
     parser.add_argument('--tlc', type=int, default=-1)
     parser.add_argument('--save-md', action='store_true')
@@ -135,10 +190,23 @@ def main():
     report_lines = []
     emit(report_lines, f'Model path: {model_path}')
     emit(report_lines, f'Raw dir: {raw_dir}')
+    if args.eval_set:
+        emit(report_lines, f'Eval set: {Path(args.eval_set).expanduser().resolve()}')
 
     filenames = sorted(raw_dir.glob('*.pkl'))
     if len(filenames) == 0:
         raise FileNotFoundError(f'no pickle files found in {raw_dir}')
+    filenames = filter_filenames_by_eval_set(filenames, args.eval_set)
+    if len(filenames) == 0:
+        raise FileNotFoundError(f'eval-set selected no pickle files from {raw_dir}')
+
+    # New-opt Recover records contain the simulated Uncover F1, but do not
+    # store a separate ``pred_uncover_f1`` because Uncover is replayed from a
+    # fixed action and only Recover is optimized.  Keep the report explicit
+    # instead of presenting an expected missing field as numeric NaN.
+    with open(filenames[0], 'rb') as handle:
+        first_raw_data = pickle.load(handle)
+    is_recover_eval = bool(first_raw_data.get('recovering', False))
 
     num_targets = 16
     targ_data_reward = [[[] for _ in range(num_targets)], [[] for _ in range(num_targets)]]
@@ -312,8 +380,8 @@ def main():
         target,
         target_names_full[target],
         samples[target],
-        pred_uncover_f1_saved_means[target],
-        pred_uncover_f1_saved_stds[target],
+        'N/A' if is_recover_eval else pred_uncover_f1_saved_means[target],
+        'N/A' if is_recover_eval else pred_uncover_f1_saved_stds[target],
         sim_uncover_f1_means[target],
         sim_uncover_f1_stds[target],
         task_fscore_means[0][target],
@@ -343,6 +411,12 @@ def main():
     ] for target in active_targets]
 
     emit(report_lines, '')
+    if is_recover_eval:
+        emit(
+            report_lines,
+            'Note: pred_uncover_f1_saved is not available for new-opt Recover records; '
+            'sim_uncover_f1 is the valid Uncover replay metric.',
+        )
     emit(report_lines, 'Per-target Uncover F1 summary')
     emit(report_lines, tabulate(
         uncover_f1_rows,
