@@ -1,14 +1,32 @@
-import cv2
-import cv2.aruco as aruco
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+REAL_WORLD_CODE = REPO_ROOT / "real_world" / "code"
+sys.path.insert(0, str(REPO_ROOT / "code"))
+sys.path.insert(0, str(REAL_WORLD_CODE))
+sys.path.insert(0, str(REPO_ROOT / "assistive-gym-fem"))
+
+from conda_python import drop_foreign_site_packages  # noqa: E402
+
+drop_foreign_site_packages()
+
+import cv2  # noqa: E402
 import pickle
 import numpy as np
 import mediapipe as mp
-import pyrealsense2 as rs
 from datetime import date
 from sympy import Point, Line
-import sys
-sys.path.insert(0, '/home/kpputhuveetil/git/vBM-GNNdev/bm-gnns')
-from assistive_gym.envs.bu_gnn_util import *
+try:
+    from assistive_gym.envs.bu_gnn_util import get_body_points_from_obs
+except ModuleNotFoundError:
+    # The vision GUI may run in robe-zed, which intentionally has no gym.
+    get_body_points_from_obs = None
+from marker_utils import bed_xy_to_pixel, pixel_to_bed_xy
+from pickle_compat import load_pickle
 import matplotlib.pyplot as plt
 import argparse
 import os.path as osp
@@ -201,15 +219,15 @@ if __name__ == '__main__':
     if image is None:
         print('IMAGE NOT FOUND')
     
-    with open(osp.join(args.pose_dir,'sim_origin_data.pkl'),'rb') as f:
-        data = pickle.load(f)
-        dist = data['dist']
-        mtx = data['mtx']
-        centers_px = data['centers_px']
-        centers_m = data['centers_m']
-        origin_px = data['origin_px']
-        origin_m = data['origin_m']
-        m2px_scale = data['m2px_scale']
+    data = load_pickle(osp.join(args.pose_dir, 'sim_origin_data.pkl'))
+    dist = data['dist']
+    mtx = data['mtx']
+    centers_px = data['centers_px']
+    centers_m = data['centers_m']
+    origin_px = data['origin_px']
+    origin_m = data['origin_m']
+    m2px_scale = data['m2px_scale']
+    pixel_to_bed_affine = data.get('pixel_to_bed_xy')
 
 
     image_height, image_width, _ = image.shape
@@ -225,10 +243,22 @@ if __name__ == '__main__':
     # cv2.imshow("Image",pose_img)
     # cv2.waitKey(0)
 
-    human_pose_px_transformed, pose_trans_img = transform_pose_to_origin_px(origin_px, human_pose_px, image)
-    human_m = human_pose_px_transformed*m2px_scale
-    human_m_correct_axis = human_m.copy()
-    human_m_correct_axis[:, [1, 0]] = human_m_correct_axis[:, [0, 1]]
+    if pixel_to_bed_affine is not None:
+        human_m_correct_axis = pixel_to_bed_xy(
+            human_pose_px,
+            pixel_to_bed_affine,
+        )
+    else:
+        # Compatibility path for old pose directories captured before the
+        # calibrated marker affine was added.
+        human_pose_px_transformed, _ = transform_pose_to_origin_px(
+            origin_px,
+            human_pose_px,
+            image,
+        )
+        human_m = human_pose_px_transformed * m2px_scale
+        human_m_correct_axis = human_m.copy()
+        human_m_correct_axis[:, [1, 0]] = human_m_correct_axis[:, [0, 1]]
     print(human_m_correct_axis)
 
     with open(osp.join(args.pose_dir,'human_pose.pkl'), 'wb') as f:
@@ -238,9 +268,22 @@ if __name__ == '__main__':
     #     pickle.dump(human_m, f)
 
 
-    with open(osp.join(args.subject_dir,'body_info.pkl'),'rb') as f:
-        body_info = pickle.load(f)
-    all_body_points = get_body_points_from_obs(human_pose=human_m_correct_axis.astype(float), target_limb_code=4, body_info=body_info)[:,:2]
+    from trial_layout import resolve_body_info
+
+    body_info_path = str(
+        resolve_body_info(Path(args.pose_dir), Path(args.subject_dir), required=False)
+    )
+    if get_body_points_from_obs is not None and osp.exists(body_info_path):
+        body_info = load_pickle(body_info_path)
+        all_body_points = get_body_points_from_obs(
+            human_pose=human_m_correct_axis.astype(float),
+            target_limb_code=4,
+            body_info=body_info,
+        )[:, :2]
+    else:
+        # Body-point overlay is optional in the vision environment.  The
+        # action environment recomputes these points from human_pose.pkl.
+        all_body_points = np.empty((0, 2), dtype=np.float64)
 
     # plt.figure()
     # # plt.scatter(human_m[:, 0], human_m[:, 1])
@@ -248,8 +291,14 @@ if __name__ == '__main__':
     # plt.scatter(all_body_points[:,1], all_body_points[:,0])
     # plt.show()
 
-    all_body_points[:, [1, 0]] = all_body_points[:, [0, 1]]
-    all_body_points_px = all_body_points*(1/m2px_scale) + origin_px
+    if pixel_to_bed_affine is not None:
+        all_body_points_px = bed_xy_to_pixel(
+            all_body_points,
+            pixel_to_bed_affine,
+        )
+    else:
+        all_body_points[:, [1, 0]] = all_body_points[:, [0, 1]]
+        all_body_points_px = all_body_points * (1 / m2px_scale) + origin_px
 
     # plt.figure()
     # # plt.scatter(human_m[:, 0], human_m[:, 1])

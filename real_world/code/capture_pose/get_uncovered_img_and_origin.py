@@ -1,113 +1,205 @@
-import cv2
-import cv2.aruco as aruco
-import pickle
-import numpy as np
-import mediapipe as mp
-import pyrealsense2 as rs
-from datetime import date
-from sympy import Point, Line
-import matplotlib.pyplot as plt
+#!/usr/bin/env python3
+"""Capture uncovered RGB + sim_origin for run_trial pose capture.
+
+This is a thin wrapper around the validated
+``calibration/calibrate_zed_markers.py`` path (multi-frame ArUco solve,
+extrinsics exposure/gain/serial).  Trial capture uses ``--no-save-extrinsics``
+so it does not rewrite ``zed_extrinsics.json``.
+
+Run with the ``robe-zed`` environment (usually via capture_human_pose.py):
+
+  conda run -n robe-zed python code/capture_pose/get_uncovered_img_and_origin.py \
+      --save-dir /path/to/pose_dir
+"""
+
+from __future__ import annotations
+
 import argparse
-import os.path as osp
-import tqdm
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+CODE_DIR = Path(__file__).resolve().parents[1]
+REAL_WORLD_DIR = CODE_DIR.parent
+CALIBRATE_SCRIPT = REAL_WORLD_DIR / "calibration" / "calibrate_zed_markers.py"
+DEFAULT_EXTRINSICS = REAL_WORLD_DIR / "calibration" / "zed_extrinsics.json"
+
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
+
+from conda_python import drop_foreign_site_packages  # noqa: E402
+
+drop_foreign_site_packages()
+
+import cv2  # noqa: E402
+
+from zed_util import (  # noqa: E402
+    configure_exposure_gain,
+    grab_rgb_bgr,
+    open_ceiling_zed,
+    warm_up,
+)
 
 
-    
-def construct_sim_origin(center_coords, dtype=float):
-    print(center_coords)
-    x1 = center_coords[0][0]
-    y1 = center_coords[0][1]
-    x2 = center_coords[2][0]
-    y2 = center_coords[2][1]
+def _ceiling_from_extrinsics(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text())
+    cameras = payload.get("cameras") or {}
+    entry = cameras.get("ceiling") or {}
+    return entry if isinstance(entry, dict) else {}
 
-    x3 = center_coords[1][0]
-    y3 = center_coords[1][1]
-    x4 = center_coords[3][0]
-    y4 = center_coords[3][1]
 
-    line1 = Line(Point(x1, y1), Point(x2, y2))
-    line2 = Line(Point(x3, y3), Point(x4, y4))
-    intersection = line1.intersection(line2)[0]
-    
-    return np.array(intersection, dtype=dtype)
+def _capture_rgb_only(
+    save_dir: Path,
+    *,
+    serial: int,
+    exposure,
+    gain,
+    warmup: int,
+) -> None:
+    """Fallback when ArUco is skipped: one uncovered RGB with calib settings."""
 
-#https://pyimagesearch.com/2020/12/21/detecting-aruco-markers-with-opencv-and-python/
-def show_aruco_tags(img, dist, mtx):
-    image = img.copy()
-    arucoDict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_6X6_250)
-    arucoParams = cv2.aruco.DetectorParameters_create()
-    (corners, ids, rejected) = cv2.aruco.detectMarkers(image, arucoDict,parameters=arucoParams)
-    #distance detection
-    markerSizeInCM = 5
-    rvec , tvec, _ = aruco.estimatePoseSingleMarkers(corners, markerSizeInCM, mtx, dist)
-    centers = {}
-    metercenters = {id:i[0]/100 for ([id],i) in zip(ids,tvec)}
-    # print(metercenters)
-    #draw on image
-    if len(corners)>0:
-        # flatten the ArUco IDs list
-        ids = ids.flatten()
-        # loop over the detected ArUCo corners
-        for (markerCorner, markerID) in zip(corners, ids):
-            # extract the marker corners (which are always returned in
-            # top-left, top-right, bottom-right, and bottom-left order)
-            (topLeft, topRight, bottomRight, bottomLeft) = markerCorner.reshape((4, 2))
+    cam = open_ceiling_zed(serial=serial)
+    try:
+        warm_up(cam, warmup)
+        if exposure is not None or gain is not None:
+            settings = configure_exposure_gain(
+                cam, exposure=exposure, gain=gain, lock=True
+            )
+            print(
+                f"Camera settings: locked exposure={settings['exposure']} "
+                f"gain={settings['gain']}"
+            )
+            warm_up(cam, 5)
+        bgr = None
+        for _ in range(20):
+            bgr = grab_rgb_bgr(cam)
+            if bgr is not None:
+                break
+        if bgr is None:
+            raise RuntimeError("Failed to grab uncovered RGB from ZED")
+    finally:
+        cam.close()
 
-            cX = int((topLeft[0] + bottomRight[0]) / 2.0)
-            cY = int((topLeft[1] + bottomRight[1]) / 2.0)
-            centers[markerID]=[cX,cY]
-            
-            cv2.circle(image, (cX, cY), 4, (0, 0, 255), -1)
-            cv2.putText(image, str(markerID),(int(topLeft[0]), int(topLeft[1]) - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    out_path = save_dir / "uncovered_rgb.png"
+    if not cv2.imwrite(str(out_path), bgr):
+        raise RuntimeError(f"Failed to write {out_path}")
+    print(f"saved: {out_path}")
+    print("Skipping ArUco / sim_origin (--skip-aruco).")
 
-    return image, centers, metercenters
-        
-if __name__ == '__main__':
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--save-dir', type=str, default='TEST')
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--save-dir", type=str, default="TEST")
+    parser.add_argument(
+        "--serial",
+        type=int,
+        default=0,
+        help="Ceiling ZED serial; 0 uses zed_extrinsics.json",
+    )
+    parser.add_argument(
+        "--extrinsics",
+        type=str,
+        default=str(DEFAULT_EXTRINSICS),
+        help="Passed through to calibrate_zed_markers --output",
+    )
+    parser.add_argument("--exposure", type=int, default=None)
+    parser.add_argument("--gain", type=int, default=None)
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=100,
+        help="Frames for calibrate_zed_markers (default 100)",
+    )
+    parser.add_argument("--warmup", type=int, default=30)
+    parser.add_argument(
+        "--max-rms-px",
+        type=float,
+        default=10.0,
+        help="Passed as --max-reprojection-rms",
+    )
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Show the same live ArUco preview as calibrate_zed_markers",
+    )
+    parser.add_argument(
+        "--skip-aruco",
+        action="store_true",
+        help="Only save uncovered_rgb.png; skip sim_origin_data.pkl",
+    )
     args = parser.parse_args()
-    # today = date.today()
 
-    #start realsense camera
-    pipeline = rs.pipeline()
-    config = rs.config()
-    config.enable_device('141722070195')
-    # config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 6)
-    config.enable_stream(rs.stream.color, 1280, 720, rs.format.rgb8, 6)
-    pipeline.start(config)
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    extrinsics = Path(args.extrinsics)
+    ceiling = _ceiling_from_extrinsics(extrinsics)
+    serial = int(args.serial) or int(ceiling.get("serial") or 0)
+    stored = ceiling.get("camera_settings") or {}
+    exposure = (
+        args.exposure if args.exposure is not None else stored.get("exposure")
+    )
+    gain = args.gain if args.gain is not None else stored.get("gain")
 
-    for i in tqdm.tqdm(range(30)):
-        pipeline.wait_for_frames()
-    
-    frames = pipeline.wait_for_frames()
-    color_frame = frames.get_color_frame()
+    if args.skip_aruco:
+        _capture_rgb_only(
+            save_dir,
+            serial=serial,
+            exposure=exposure,
+            gain=gain,
+            warmup=args.warmup,
+        )
+        return
 
-    # #calculating camera intrinsics
-    intrinsics = color_frame.profile.as_video_stream_profile().get_intrinsics()
-    dist = np.array(intrinsics.coeffs)
-    mtx = np.array([[intrinsics.fx, 0, intrinsics.width],[0,intrinsics.fy,intrinsics.height],[0,0,1]])
+    if not CALIBRATE_SCRIPT.is_file():
+        raise FileNotFoundError(f"Missing validated calibrator: {CALIBRATE_SCRIPT}")
 
-    pipeline.stop()
+    command = [
+        sys.executable,
+        str(CALIBRATE_SCRIPT),
+        "--role",
+        "ceiling",
+        "--serial",
+        str(serial),
+        "--output",
+        str(extrinsics),
+        "--sim-origin-dir",
+        str(save_dir),
+        "--no-save-extrinsics",
+        "--frames",
+        str(args.frames),
+        "--warmup",
+        str(args.warmup),
+        "--max-reprojection-rms",
+        str(args.max_rms_px),
+        "--lock-exposure-gain",
+    ]
+    if exposure is not None:
+        command.extend(["--exposure", str(int(exposure))])
+    if gain is not None:
+        command.extend(["--gain", str(int(gain))])
+    if args.preview:
+        command.append("--preview")
 
-    img = cv2.cvtColor(np.asanyarray(color_frame.get_data()), cv2.COLOR_BGR2RGB)
-    filename = 'uncovered_rgb.png'
-    cv2.imwrite(osp.join(args.save_dir, filename), img)
-    print(f'saved: {filename}')
+    print("Using validated calibrator for uncovered RGB + sim_origin:")
+    print(">>", " ".join(command))
+    subprocess.check_call(command)
 
-    image = cv2.imread(osp.join(args.save_dir, filename))   
-    aru, centers, metercenters = show_aruco_tags(image, dist, mtx)
-    origin_px = construct_sim_origin(centers, int)
-    origin_m = construct_sim_origin(metercenters)
-    m2px_scale = origin_m/origin_px             # this is the ratio of meters to pixels
+    required = (
+        save_dir / "sim_origin_data.pkl",
+        save_dir / "uncovered_rgb.png",
+    )
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise RuntimeError(
+            "calibrate_zed_markers finished but missing: " + ", ".join(missing)
+        )
 
-    with open(osp.join(args.save_dir,'sim_origin_data.pkl'), 'wb') as f:
-        pickle.dump({
-            'dist':dist, 
-            'mtx':mtx,
-            'centers_px':centers,
-            'centers_m':metercenters,
-            'origin_px':origin_px,
-            'origin_m':origin_m,
-            'm2px_scale':m2px_scale
-            }, f)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,15 @@
+# Goal
+float32 grasp_x
+float32 grasp_y
+float32 release_x
+float32 release_y
+string frame_id
+string trial_id
+---
+# Result
+bool success
+string failure_stage
+string message
+---
+# Feedback
+string stage

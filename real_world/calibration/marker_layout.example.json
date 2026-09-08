@@ -1,0 +1,22 @@
+{
+  "dictionary": "DICT_5X5_100",
+  "marker_size_m": 0.07,
+  "frame": "bed",
+  "geometry_status": "fill_measured_geometry",
+  "axes": {
+    "origin": "center of the four top-marker centers",
+    "x_positive": "bed-head-left to bed-head-right",
+    "y_positive": "bed-head to bed-foot",
+    "z_positive": "away from the mattress"
+  },
+  "markers": {
+    "0": {"name": "bed_head_left_top", "center_m": null, "u_axis": null, "v_axis": null},
+    "1": {"name": "bed_head_right_top", "center_m": null, "u_axis": null, "v_axis": null},
+    "2": {"name": "bed_foot_right_top", "center_m": null, "u_axis": null, "v_axis": null},
+    "3": {"name": "bed_foot_left_top", "center_m": null, "u_axis": null, "v_axis": null},
+    "10": {"name": "bed_head_left_side", "center_m": null, "u_axis": null, "v_axis": null},
+    "11": {"name": "bed_head_right_side", "center_m": null, "u_axis": null, "v_axis": null},
+    "12": {"name": "bed_foot_right_side", "center_m": null, "u_axis": null, "v_axis": null},
+    "13": {"name": "bed_foot_left_side", "center_m": null, "u_axis": null, "v_axis": null}
+  }
+}

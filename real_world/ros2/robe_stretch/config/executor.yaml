@@ -1,0 +1,118 @@
+# ROS 2 params file. Nested keys become dotted names (pull.xy_speed_m_s).
+/**:
+  ros__parameters:
+    gripper_down.yaw: 1.5708
+    gripper_down.pitch: -1.57
+    gripper_down.roll: 0.0
+    gripper_down.settle_s: 0.5
+    pull.clearance_above_bed_m: 0.40
+    # Empty = full pull. Stage name = complete that stage then stop.
+    pull.stop_after: ""
+    # Deprecated; treated as stop_after=VERIFY_PREGRASP if stop_after is empty.
+    pull.stop_after_pregrasp: false
+    # Test only: after uncover place, pick there and place back at uncover pick.
+    pull.round_trip: false
+    pull.xy_speed_m_s: 0.05
+    pull.dt_s: 0.08
+    pull.controller: streaming
+    # Frozen recipes: verify-only | contact-only | grasp-only | full-pull.
+    pull.recipe: full-pull
+    pull.dry_run: false
+    # reject (production) | warn (debug leftover). After WRIST_DOWN / base shift.
+    live_geometry.policy: reject
+    pull.contact_effort: 40.0
+    pull.contact_abort_m: 0.02
+    # robot_default: no point.effort; stretch_body uses this robot's
+    # asymmetric contact_thresh_default. Do not copy clean_surface 33.7.
+    # custom_symmetric: debug only; driver maps e to ±e.
+    contact.threshold_mode: robot_default
+    # Debug only when threshold_mode=custom_symmetric.
+    contact.lift_effort: 33.7
+    contact.approach_effort: 55.0
+    contact.raise_effort: 60.0
+    # All lift-up / free moves. Raise-against-gravity must not trip 100.
+    contact.disable_effort: 100.0
+    # First centimetres down with contact off (lift is often already at max).
+    contact.breakaway_m: 0.03
+    # Deprecated. Contact uses driver error 100, not a Python spike.
+    contact.effort_spike: 12.0
+    # Mechanical panic only. Contact is relative unload, not cloth Z.
+    contact.max_descent_m: 0.50
+    contact.min_descent_m: 0.05
+    contact.cloth_margin_m: 0.02
+    contact.guard_band_m: 0.06
+    # Unused for the cloth probe (kept for pull / legacy).
+    contact.lower_speed_m_s: 0.05
+    contact.lower_accel_m_s2: 0.12
+    contact.hover_positive_warn_pct: 55.0
+    # Unused for contact stop (trace diagnostic only).
+    contact.lift_effort_threshold: 20.0
+    contact.move_increment_m: 0.008
+    # Unused for contact (kept so old overlays still load).
+    contact.cloth_below_estimate_m: 0.10
+    contact.lowest_allowed_m: 0.0
+    # Keep the exact hover baseline / descent effort evidence for every trial.
+    contact.log_trace: true
+    contact.trace_path: ""
+    contact.coarse_standoff_m: 0.03
+    contact.coarse_speed_m_s: 0.07
+    contact.coarse_accel_m_s2: 0.15
+    contact.probe_step_m: 0.02
+    contact.probe_max_m: 0.06
+    contact.probe_speed_m_s: 0.04
+    contact.probe_accel_m_s2: 0.10
+    contact.baseline_settle_s: 0.5
+    contact.baseline_samples: 15
+    contact.window_samples: 8
+    # Stop when filtered lift effort falls this % below in-motion hover.
+    # 6% of hover ~25 is 1.5 points, smaller than the start-of-motion
+    # 36→25 transient. Cloth unload on this bed is ~10 points (25→15).
+    contact.unload_drop_pct: 15.0
+    contact.unload_consecutive: 2
+    contact.compress_max_m: 0.03
+    contact.detect_above_cloth_m: 0.008
+    approach.retract_arm_m: 0.05
+    approach.clear_above_cloth_m: 0.12
+    approach.pregrasp_pass_m: 0.015
+    approach.pregrasp_reject_m: 0.025
+    approach.refine_passes: 1
+    grasp.lift_after_contact_m: 0.07
+    grasp.lower_after_open_m: 0.040
+    grasp.probe_extra_m: 0.02
+    grasp.pause_after_bump_s: 1.0
+    grasp.pause_after_probe_s: 2.0
+    grasp.pause_after_close_s: 2.0
+    grasp.gripper_open: 0.35
+    grasp.gripper_closed: -0.20
+    workspace.arm_min_m: 0.0
+    workspace.arm_max_m: 0.52
+    workspace.lift_min_m: 0.0
+    workspace.lift_max_m: 1.10
+    workspace.base_forward_in_base: [1.0, 0.0]
+    workspace.arm_extends_in_base: [0.0, -1.0]
+    frames.odom: odom
+    frames.base: base_link
+    frames.layout: layout
+    frames.camera_optical: camera_color_optical_frame
+    frames.grasp_center: link_grasp_center
+    frames.wrist_tag: link_aruco_inner_wrist
+    localization.min_posts: 3
+    localization.min_posts_per_view: 1
+    localization.min_pixel_size: 20.0
+    localization.settle_s: 2.0
+    localization.dwell_s: 2.5
+    localization.frames_per_view: 8
+    localization.reprojection_rms_max_px: 12.0
+    localization.translation_std_max_m: 0.08
+    localization.rotation_max_deg: 2.0
+    localization.origin_spread_max_m: 0.12
+    # Sanity cap only. 4-tag centroid vs layout origin is ~0.06 m on this bed.
+    localization.origin_disagree_max_m: 0.25
+    localization.head_tilt: -0.15
+    localization.pan_start: -1.05
+    localization.pan_end: -2.59
+    localization.n_stops: 1
+    localization.yaw_tolerance_rad: 0.15
+    min_posts: 3
+    head_tilt: -0.15
+    look_first: false

@@ -1,3 +1,9 @@
+"""Legacy RealSense helpers retained for old analysis notebooks.
+
+The real-world capture path now uses ``zed_util`` and fixed ArUco-derived
+``T_bed_camera`` transforms in ``capture_and_merge_pcds.py``. The FPFH/RANSAC
+helpers below are not part of the ZED production merge path.
+"""
 
 import copy
 import pickle
@@ -5,7 +11,11 @@ import os
 import os.path as osp
 import argparse
 import numpy as np
-import pyrealsense2 as rs
+
+try:
+    import pyrealsense2 as rs
+except ImportError:  # optional; not needed for ZED ceiling path
+    rs = None
 import matplotlib.pyplot as plt
 import open3d as o3d
 import colorsys
@@ -14,6 +24,9 @@ from skimage.color import rgb2hsv
 import cv2
 
 def get_pointcloud(pipeline):
+    if rs is None:
+        raise RuntimeError("pyrealsense2 not installed; use zed_util for ceiling capture")
+
     pc = rs.pointcloud()
     align = rs.align(rs.stream.color)
 
