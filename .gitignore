@@ -6,3 +6,47 @@ outputs/
 *.zip
 *.pkl
 *.pth
+*.pt
+*.ckpt
+*.npz
+*.pcd
+*.ply
+*.mp4
+*.avi
+
+# Local simulator data, checkpoints, and generated evaluations.
+DATASETS/
+trained_models/
+evaluation_outputs/
+audit_outputs/
+matrix_outputs*/
+experiments/
+code/matrix_outputs*/
+
+# Physical-study captures and machine-specific state.
+real_world/STUDY_DATA/
+real_world/sessions/*/
+real_world/calibration/*.json
+real_world/calibration/*.pcd
+real_world/calibration/*.ply
+real_world/calibration/*.png
+!real_world/calibration/*.example.json
+real_world/pilot_voxel_source/
+real_world/temp.ply
+real_world/code/temp.ply
+validation_*.png
+
+# ROS/build and local tooling artifacts.
+build/
+install/
+log/
+.cache/
+*.swp
+--*
+
+# Intentionally excluded experimental branches for this release.
+code/run_robe_sim_joint_opt.py
+real_world/code/get_action/get_ppo_action.py
+code/*score_corrector*
+code/*residual*
+code/*PredIntermediate*
